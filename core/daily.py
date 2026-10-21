@@ -1,0 +1,322 @@
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timedelta
+
+from .engine import (
+    compute_fitness,
+    compute_acwr,
+    compute_readiness,
+    evaluate_gates,
+    evaluate_reds,
+)
+from . import cycle as cyclemod
+
+def _iso(d) -> str:
+    return d.isoformat()
+
+def _loads_by_day(conn, end_day: date, lookback: int = 120) -> dict:
+    start = end_day - timedelta(days=lookback)
+    rows = conn.execute(
+        "SELECT substr(start_time,1,10) AS d, COALESCE(SUM(load_final),0) AS load "
+        "FROM activities WHERE start_time >= ? AND start_time <= ? "
+        "GROUP BY substr(start_time,1,10)",
+        (_iso(start), _iso(end_day)),
+    ).fetchall()
+    srows = conn.execute(
+        "SELECT date AS d, COALESCE(SUM(srpe_au),0) AS load FROM strength_sessions "
+        "WHERE date >= ? AND date <= ? GROUP BY date",
+        (_iso(start), _iso(end_day)),
+    ).fetchall()
+    out = {}
+    for r in rows:
+        out[r["d"]] = out.get(r["d"], 0.0) + (r["load"] or 0.0)
+    for r in srows:
+        out[r["d"]] = out.get(r["d"], 0.0) + (r["load"] or 0.0)
+    return out
+
+def _load_series(conn, end_day: date, lookback: int = 120) -> list[float]:
+    by_day = _loads_by_day(conn, end_day, lookback)
+    series = []
+    d = end_day - timedelta(days=lookback)
+    while d <= end_day:
+        series.append(round(by_day.get(_iso(d), 0.0), 1))
+        d += timedelta(days=1)
+    return series
+
+def _rolling_dev(conn, table_col: str, end_day: date, window: int = 14) -> list[tuple[str, float | None]]:
+    start = end_day - timedelta(days=window * 2)
+    rows = conn.execute(
+        f"SELECT date, {table_col} AS v FROM daily_metrics WHERE date >= ? AND date <= ? ORDER BY date",
+        (_iso(start), _iso(end_day)),
+    ).fetchall()
+    vals = [(r["date"], r["v"]) for r in rows if r["v"] is not None]
+    out = []
+    for i, (d, v) in enumerate(vals):
+        prior = [x for _, x in vals[max(0, i - window):i] if x is not None]
+        if prior:
+            base = sum(prior) / len(prior)
+            dev = round((v - base) / base * 100, 2) if base else None
+        else:
+            dev = None
+        out.append((d, dev))
+    return out
+
+def _metric_dev_series(conn, end_day: date) -> tuple[list, list]:
+    hrv = _rolling_dev(conn, "hrv_last_night", end_day)
+    rhr = _rolling_dev(conn, "resting_hr", end_day)
+    return hrv, rhr
+
+def _cycle_flags(conn, end_day: date, cfg: dict) -> dict:
+    periods = [dict(r) for r in conn.execute(
+        "SELECT start_date, end_date FROM cycle_periods ORDER BY start_date").fetchall()]
+    return cyclemod.evaluate_flags(periods, end_day, cfg)
+
+def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
+    end = date.fromisoformat(day[:10])
+    series = _load_series(conn, end)
+    fit = compute_fitness(series, cfg["fitness"]["tau_ctl"], cfg["fitness"]["tau_atl"])
+    last = fit[-1]
+    ctl, atl, tsb = last["ctl"], last["atl"], last["tsb"]
+    first_load_idx = next((i for i, l in enumerate(series) if l and l > 0), None)
+    warmup = (first_load_idx is None) or ((len(series) - 1 - first_load_idx) < 28)
+
+    acwr_info = compute_acwr(series)
+    chronic_floor = cfg["fitness"]["chronic_floor_acwr"]
+    acwr = None
+    ewma7 = ewma28 = None
+    if acwr_info and not warmup and acwr_info["ewma28"] >= chronic_floor:
+        acwr = acwr_info["acwr"]
+        ewma7, ewma28 = acwr_info["ewma7"], acwr_info["ewma28"]
+
+    dm = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (day,)).fetchone()
+    sub = conn.execute("SELECT * FROM subjective WHERE date=?", (day,)).fetchone()
+
+    hrv_series, rhr_series = _metric_dev_series(conn, end)
+    hrv_dev = next((dev for d, dev in hrv_series if d == day), None)
+    rhr_dev = next((dev for d, dev in rhr_series if d == day), None)
+    hrv_dev_hist = [dev for _, dev in hrv_series if dev is not None]
+    rhr_dev_hist = [dev for _, dev in rhr_series if dev is not None]
+
+    sleep_h = dm["sleep_hours"] if dm else None
+    soreness = sub["soreness"] if sub else None
+    sleep_feel = sub["sleep_feel"] if sub else None
+
+    weights = cfg["readiness"]["weights"]
+    readiness = compute_readiness(hrv_dev, tsb, sleep_h, rhr_dev, soreness, sleep_feel, weights)
+
+    cycle_flags = _cycle_flags(conn, end, cfg)
+
+    injury_rows = conn.execute(
+        "SELECT * FROM injury_history WHERE status IN ('active','restricted')").fetchall()
+    injury_active = len(injury_rows) > 0
+    injury_constraints = {}
+    for r in injury_rows:
+        if r["constraint_json"]:
+            try:
+                injury_constraints.update(json.loads(r["constraint_json"]))
+            except Exception:
+                pass
+
+    red_s_state = conn.execute(
+        "SELECT value FROM meta WHERE key='red_s_state'").fetchone()
+    red_s_active = red_s_state is not None and red_s_state["value"] == "active"
+
+    cramps = None
+    cd = conn.execute("SELECT * FROM cycle_daily WHERE date=?", (day,)).fetchone()
+    if cd and cd["symptoms"]:
+        try:
+            symptoms = json.loads(cd["symptoms"])
+            for sym in symptoms:
+                if isinstance(sym, dict) and sym.get("type") == "cramps":
+                    cramps = sym.get("severity")
+        except Exception:
+            pass
+
+    gates_ctx = {
+        "tsb": tsb, "acwr": acwr, "readiness": readiness["score"],
+        "sleep_hours": sleep_h, "hrv_dev_history": hrv_dev_hist,
+        "rhr_dev_history": rhr_dev_hist,
+        "luteal_phase_confound": cycle_flags.get("luteal_phase_confound", False),
+        "injury_active": injury_active, "red_s_active": red_s_active,
+        "cramps_today": cramps,
+    }
+    gates = evaluate_gates(gates_ctx, cfg)
+
+    reds_ctx = {
+        "hrv_dev_history": hrv_dev_hist, "rhr_dev_history": rhr_dev_hist,
+        "cycle_irregular": cycle_flags.get("cycle_irregular", False),
+        "cycle_missed": cycle_flags.get("cycle_missed", False),
+    }
+    reds = evaluate_reds(reds_ctx, cfg)
+
+    flags = []
+    if warmup:
+        flags.append("warmup")
+    if cycle_flags.get("luteal_phase_confound"):
+        flags.append("luteal_phase_confound")
+
+    row = {
+        "date": day, "ctl": ctl, "atl": atl, "tsb": tsb, "acwr": acwr,
+        "ewma7": ewma7, "ewma28": ewma28,
+        "readiness_score": readiness["score"], "readiness_confidence": readiness["confidence"],
+        "pillars": json.dumps(readiness["pillars"], ensure_ascii=False),
+        "inputs_used": json.dumps(gates_ctx, ensure_ascii=False, default=str),
+        "gates_triggered": json.dumps(gates, ensure_ascii=False),
+        "flags": json.dumps(flags, ensure_ascii=False),
+        "param_version": cfg["_root"] and "p2026-10",
+        "calc_version": "1.3",
+    }
+    cols = list(row.keys())
+    conn.execute(
+        f"INSERT INTO engine_daily({','.join(cols)}) VALUES({','.join('?' for _ in cols)}) "
+        "ON CONFLICT(date) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in cols if c != "date"),
+        [row[c] for c in cols],
+    )
+    conn.commit()
+    row["pillars"] = readiness["pillars"]
+    row["gates_triggered"] = gates
+    row["flags"] = flags
+    row["hrv_dev_pct"] = hrv_dev
+    row["rhr_dev_pct"] = rhr_dev
+    return row
+
+def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
+    day = day or date.today().isoformat()
+    eng = compute_engine_daily(conn, cfg, day)
+    dm = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (day,)).fetchone()
+    sub = conn.execute("SELECT * FROM subjective WHERE date=?", (day,)).fetchone()
+    body = conn.execute(
+        "SELECT weight_7d_avg FROM body_metrics ORDER BY measured_at DESC LIMIT 1").fetchone()
+    periods = [dict(r) for r in conn.execute(
+        "SELECT start_date, end_date FROM cycle_periods ORDER BY start_date").fetchall()]
+    cycle = cyclemod.predict(date.fromisoformat(day), periods)
+
+    sub_rows = conn.execute(
+        "SELECT date FROM subjective ORDER BY date DESC LIMIT 1").fetchone()
+    last_input = sub_rows["date"] if sub_rows else None
+    streak = _streak_days(conn, day)
+    escalation = _escalation(conn, cfg, day, streak)
+
+    recent = [dict(r) for r in conn.execute(
+        "SELECT sport_id, substr(start_time,1,10) AS date, duration_min, rpe, srpe_au, "
+        "hr_trimp, load_final, load_path_used, intensity_domain, mismatch_flag "
+        "FROM activities WHERE start_time <= ? ORDER BY start_time DESC LIMIT 10",
+        (day,)).fetchall()]
+    recent.reverse()
+
+    strength = [dict(r) for r in conn.execute(
+        "SELECT exercise_id, pattern, srpe_au, vi, mismatch_flag FROM strength_sessions "
+        "WHERE date = ?", (day,)).fetchall()]
+
+    plan_ctx = _plan_context(conn, day)
+
+    return {
+        "date": day,
+        "recovery": {
+            "sleep_hours": dm["sleep_hours"] if dm else None,
+            "sleep_stages": {
+                "deep": dm["sleep_deep_h"] if dm else None,
+                "light": dm["sleep_light_h"] if dm else None,
+                "rem": dm["sleep_rem_h"] if dm else None,
+                "awake": dm["sleep_awake_h"] if dm else None,
+            },
+            "hrv_last_night": dm["hrv_last_night"] if dm else None,
+            "hrv_dev_pct": eng.get("hrv_dev_pct"),
+            "resting_hr": dm["resting_hr"] if dm else None,
+            "stress_daily_avg": dm["stress_daily_avg"] if dm else None,
+            "data_status": dm["data_status"] if dm else "missing",
+        },
+        "cycle": {
+            "phase": cycle["phase"], "cycle_day": cycle["cycle_day"],
+            "days_to_predicted_period": cycle["days_to_predicted_period"],
+            "prediction_confidence": cycle["prediction_confidence"],
+            "source": "user", "contraception_mode": _contraception(conn),
+        },
+        "self_computed": {
+            "readiness_score": eng["readiness_score"],
+            "confidence": eng["readiness_confidence"],
+            "pillars": eng["pillars"],
+            "ctl": eng["ctl"], "atl": eng["atl"], "tsb": eng["tsb"], "acwr": eng["acwr"],
+            "gates_triggered": eng["gates_triggered"], "flags": eng["flags"],
+        },
+        "recent_activities": recent,
+        "strength_sessions": strength,
+        "subjective": {
+            "soreness": sub["soreness"] if sub else None,
+            "sleep_feel": sub["sleep_feel"] if sub else None,
+            "injury_flag": bool(sub["injury_flag"]) if sub else False,
+            "streak_days": streak,
+        },
+        "body": {"weight_7d_avg": body["weight_7d_avg"] if body else None},
+        "plan_context": plan_ctx,
+        "data_quality": {
+            "hr_source": _hr_source(conn),
+            "feeding": {"subjective_streak_days": streak, "last_input": last_input,
+                        "escalation_level": escalation},
+            "obs_state_notes": [],
+            "notes": [],
+        },
+        "versions": {"engine": "1.3", "schema": "1.7", "param": "p2026-10"},
+    }
+
+def _streak_days(conn, day: str) -> int:
+    d = date.fromisoformat(day)
+    n = 0
+    while True:
+        row = conn.execute("SELECT 1 FROM subjective WHERE date=?", (d.isoformat(),)).fetchone()
+        if row:
+            n += 1
+            d -= timedelta(days=1)
+        else:
+            break
+    return n
+
+def _escalation(conn, cfg: dict, day: str, streak: int) -> str:
+    f = cfg["feeding"]
+    if streak >= f["l3_subjective_days"]:
+        return "L3"
+    if streak >= f["l2_subjective_days"]:
+        return "L2"
+    if streak >= f["l1_subjective_days"]:
+        return "L1"
+    return "L0"
+
+def _contraception(conn) -> str:
+    row = conn.execute("SELECT contraception FROM athlete_profile WHERE id=1").fetchone()
+    return row["contraception"] if row and row["contraception"] else "none"
+
+def _hr_source(conn) -> str:
+    row = conn.execute("SELECT hr_rest_source FROM athlete_profile WHERE id=1").fetchone()
+    return "wrist" if row and row["hr_rest_source"] else "unknown"
+
+def _plan_context(conn, day: str) -> dict:
+    d = date.fromisoformat(day)
+    week_start = (d - timedelta(days=d.weekday())).isoformat()
+    plan = conn.execute(
+        "SELECT * FROM weekly_plans WHERE week_start=? AND status='active'", (week_start,)).fetchone()
+    if not plan:
+        plan = conn.execute(
+            "SELECT * FROM weekly_plans WHERE week_start=? AND status='draft'", (week_start,)).fetchone()
+    if not plan:
+        return {"week": f"{d.isocalendar().year}-W{d.isocalendar().week:02d}",
+                "template_id": None, "planned_au": None, "actual_au": None,
+                "completion_pct": None, "mesocycle_states": {}}
+    plan_json = json.loads(plan["plan"]) if isinstance(plan["plan"], str) else plan["plan"]
+    planned = sum(s.get("planned_au", 0) for dd in plan_json.get("days", {}).values()
+                  for s in dd.get("sessions", []))
+    actual = _loads_by_day(conn, d, 6).get(day, 0.0)
+    return {
+        "week": f"{d.isocalendar().year}-W{d.isocalendar().week:02d}",
+        "template_id": plan["template_id"],
+        "planned_au": planned,
+        "actual_au": round(actual, 1),
+        "completion_pct": round(actual / planned, 2) if planned else None,
+        "mesocycle_states": _meso_states(conn),
+    }
+
+def _meso_states(conn) -> dict:
+    rows = conn.execute(
+        "SELECT sport_id, mesocycle_state FROM sport_registry WHERE active=1").fetchall()
+    return {r["sport_id"]: r["mesocycle_state"] for r in rows}

@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "周计划槽位 schema（自描述）",
+  "slot": {
+    "type": "object",
+    "properties": {
+      "slot": {"type": "string", "description": "角色_课型，只认角色不认项目名"},
+      "sport_id": {"type": "string"},
+      "pattern": {"type": "string", "description": "干扰矩阵肌群映射"},
+      "pct": {"type": "number", "description": "占周预算百分比"},
+      "planned_rpe": {"type": "integer", "minimum": 1, "maximum": 10},
+      "planned_min": {"type": "number"},
+      "venue_need": {"type": ["string", "null"]},
+      "forbidden": {"type": "array", "items": {"type": "string"}},
+      "optional": {"type": "boolean", "default": false},
+      "structure": {"type": ["string", "null"]},
+      "notes": {"type": "string"}
+    },
+    "required": ["slot", "sport_id", "pattern", "pct", "planned_rpe", "planned_min"]
+  },
+  "day_type": {"enum": ["single", "double", "rest_zero"]},
+  "budget_formula": "week_budget_au = round(7 × CTL × modifier)",
+  "budget_cap": "budget ≤ 7 × CTL × 1.08"
+}

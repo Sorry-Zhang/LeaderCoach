@@ -1,0 +1,115 @@
+# ============================================================
+# LeaderCoach —— 配置模板
+# 用法：复制为 config.toml，再按需填写。
+# 数据采集走 Garmin 插件 MCP，凭据由插件会话文件管理，不写入本文件。
+# ============================================================
+
+[paths]
+db = "db/coach.db"                 # SQLite 主库
+fit_archive = "archive/fit"        # FIT 原始归档（只写不改）
+backup_dir = "backup/"             # 备份产物目录
+fit_import_dir = ""                # 本地 .fit 目录（Garmin Express 同步目录，可选）
+csv_import_dir = ""                # Garmin Connect「导出数据」解压目录（可选）
+
+[weather]
+provider = "open-meteo"            # 免费，无 key
+enabled = false                    # 置 true 才启用
+lat = 39.90
+lon = 116.40
+cache_hours = 3
+timeout_s = 10
+
+[notify]
+channel = "toast"                  # toast | ntfy | both
+ntfy_topic = "REPLACE_WITH_RANDOM_24CHAR"   # 自建 ≥24 字符随机串，topic 即密码
+quiet_hours = ["22:30", "07:00"]
+
+[feeding]
+l1_subjective_days = 2
+l2_subjective_days = 4
+l3_subjective_days = 7
+l1_sync_fail_days = 1
+l2_sync_fail_days = 2
+weight_gap_days = 10
+
+[confirm]
+code_length = 4
+ttl_seconds = 300
+max_attempts = 3
+
+[llm]
+model_path = "local://your-14B-model"
+context_window = 32768
+temperature = 0.4
+
+[mcp]
+transport = "stdio"
+
+# ---------- 引擎区（数据字典/引擎规格 §12） ----------
+
+[load]
+k_bridge_default = 2.6             # D 类工程默认，学习对象（逐运动可覆盖）
+mismatch_tol = 0.40
+luteal_mismatch_tol = 0.50
+
+[fitness]
+tau_ctl = 42
+tau_atl = 7
+tsb_soft_gate = -100               # 学习对象
+tsb_hard_gate = -170               # 学习对象
+chronic_floor_acwr = 400
+r1_daily_cap_ratio = 1.3
+
+[acwr]
+green = [0.8, 1.3]
+freeze_threshold = 1.5
+
+[readiness]
+weights = { hrv = 0.25, tsb = 0.25, sleep = 0.20, rhr = 0.15, subjective = 0.15 }
+
+[gates]
+hrv_dev_gate = -15
+hrv_gate_persist_days = 2
+luteal_gate_persist_days = 3
+rhr_dev_gate = 10
+rhr_gate_persist_days = 2
+sleep_min_for_quality = 5
+readiness_easy_floor = 40
+
+[cycle]
+enabled = true
+amenorrhea_days = 45
+cycle_anomaly_days = 7
+
+[reds]
+weight_drop_pct = 5
+weight_baseline_window_d = 30
+hrv_dev_persist_days = 7
+rhr_dev_persist_pct = 8
+protein_g_per_kg = [1.8, 2.2]
+load_reduction_pct = [20, 30]
+
+[learning]
+calibration_n_min = 60
+calibration_move_cap_pct = 20
+calibration_confirm_months = 2
+k_bridge_n_min = 40
+k_bridge_r2_min = 0.5
+phase_effect_min_cycles = 2
+weather_sensitivity_enabled = false
+
+# ---------- 模板区（模板库规格 §9） ----------
+
+[templates]
+version = "1.0"
+block_length_weeks = 4
+progression_step = [1.05, 1.08]
+deload_reduction = [0.30, 0.40]
+taper_window_days = [7, 10]
+completion_t2_threshold = 0.90
+completion_t1_threshold = 0.75
+slot_au_band_pct = 15
+slot_rpe_band = 1
+t4_soft_budget = [0.70, 0.80]
+t4_hard_budget = [0.50, 0.60]
+t6_budget = [0.70, 0.80]

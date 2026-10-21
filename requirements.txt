@@ -1,0 +1,17 @@
+# Garmin AI Coach dependencies (Python >= 3.11)
+# Install: python -m pip install -r requirements.txt
+
+# MCP server (stdio transport; pin 1.x stable API)
+mcp>=1.2.0,<2.0
+
+# Garmin 数据采集走插件 MCP（见 THIRD_PARTY_NOTICES.md），
+# 本仓库不再依赖 garth / garth-ng。
+
+# FIT file parsing
+fitdecode>=0.10.0
+
+# HTTP (open-meteo weather, ntfy push)
+requests>=2.31.0
+
+# Windows toast notifications (confirmation codes)
+winotify>=1.1.0; sys_platform == "win32"

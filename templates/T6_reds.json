@@ -1,0 +1,11 @@
+{
+  "template_id": "T6_reds",
+  "branch": "reds",
+  "budget_modifier": [0.70, 0.80],
+  "notes": "RED-S 周（red_s_state='active'）：预算 ×0.70–0.80；无 quality；MED 频率底线保留（攀 2 次、力量 1–2 次——维持习惯与代谢，不加刺激）；notes 强制携带『蛋白质 1.8–2.2 g/kg + 暂停减脂』文本；至 red_s_state 清除后经 T1 重入。",
+  "rules": {
+    "no_quality": true,
+    "maintain_floor": {"climb": 2, "strength": 1},
+    "notes_forced": "蛋白质 1.8–2.2 g/kg + 暂停减脂"
+  }
+}

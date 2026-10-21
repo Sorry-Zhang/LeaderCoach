@@ -1,0 +1,10 @@
+{
+  "template_id": "T6_injury",
+  "branch": "injury",
+  "budget_modifier": [0.70, 0.80],
+  "notes": "伤病周（injury_flag 或 active 约束驱动）：按 constraint_json 逐槽处理。禁跑 → primary 槽切 rehab_easy（registry 无低冲击运动则 rest_zero）；限攀 volume_only → secondary_intensity 槽 forbidden=['intensity','hangboard']。",
+  "rules": {
+    "forbid_run": {"primary_slots": "rehab_easy_or_rest", "budget_modifier": [0.70, 0.80]},
+    "limit_climb_volume_only": {"forbid": ["intensity", "hangboard"]}
+  }
+}

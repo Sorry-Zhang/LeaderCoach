@@ -1,0 +1,29 @@
+{
+  "template_id": "T3_deload",
+  "budget_modifier": [0.60, 0.70],
+  "quality_2": false,
+  "notes": "减量周。primary_long −50%；primary_quality RPE 6–7、AU 减半；secondary 禁指力板；强度占比 ≤10%；力量槽 sets −50% 保强度。",
+  "days": {
+    "mon": {"day_type": "single", "sessions": [
+      {"slot": "support_lower", "sport_id": "strength", "pattern": "squat", "pct": 8.7, "planned_rpe": 5, "planned_min": 25, "venue_need": "home_gym", "forbidden": [], "optional": false, "structure": null, "notes": "sets −50% 保强度"}
+    ]},
+    "tue": {"day_type": "single", "sessions": [
+      {"slot": "primary_quality", "sport_id": "run", "pattern": "lower_impact", "pct": 10.65, "planned_rpe": 6, "planned_min": 40, "venue_need": null, "forbidden": [], "optional": false, "structure": "intervals_short", "notes": "AU 减半，RPE 6–7"}
+    ]},
+    "wed": {"day_type": "double", "sessions": [
+      {"slot": "secondary_intensity", "sport_id": "climb", "pattern": "upper_pull_finger", "pct": 20.0, "planned_rpe": 6, "planned_min": 60, "venue_need": "climbing_gym", "forbidden": ["hangboard"], "optional": false, "structure": null, "notes": "禁指力板"},
+      {"slot": "primary_easy", "sport_id": "run", "pattern": "lower_impact", "pct": 5.0, "planned_rpe": 3, "planned_min": 45, "venue_need": null, "forbidden": [], "optional": false, "structure": null, "notes": ""}
+    ]},
+    "thu": {"day_type": "rest_zero", "sessions": []},
+    "fri": {"day_type": "single", "sessions": [
+      {"slot": "secondary_volume", "sport_id": "climb", "pattern": "upper_pull_finger", "pct": 14.0, "planned_rpe": 5, "planned_min": 60, "venue_need": "climbing_gym", "forbidden": ["hangboard"], "optional": false, "structure": null, "notes": ""}
+    ]},
+    "sat": {"day_type": "double", "sessions": [
+      {"slot": "support_upper_core", "sport_id": "strength", "pattern": "pull", "pct": 7.3, "planned_rpe": 5, "planned_min": 20, "venue_need": "home_gym", "forbidden": [], "optional": false, "structure": null, "notes": "sets −50%"},
+      {"slot": "primary_easy", "sport_id": "run", "pattern": "lower_impact", "pct": 5.0, "planned_rpe": 3, "planned_min": 45, "venue_need": null, "forbidden": [], "optional": false, "structure": null, "notes": ""}
+    ]},
+    "sun": {"day_type": "single", "sessions": [
+      {"slot": "primary_long", "sport_id": "run", "pattern": "lower_impact", "pct": 9.35, "planned_rpe": 4, "planned_min": 55, "venue_need": null, "forbidden": [], "optional": false, "structure": null, "notes": "primary_long −50%"}
+    ]}
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "template_id": "T4_transform",
+  "transform": true,
+  "notes": "降载周（闸门驱动，无固定网格）。T4 = transform(上周 active 网格, 级联, 级别)。soft: quality ≤1；hard: quality=0 且最高 AU 日次日强制 rest_zero。",
+  "soft": {"budget_modifier": [0.70, 0.80], "quality_max": 1},
+  "hard": {"budget_modifier": [0.50, 0.60], "quality_max": 0, "next_day_rest": true},
+  "cascade": ["strength_volume", "easy_run_volume", "climb_volume", "climb_intensity", "run_quality"]
+}

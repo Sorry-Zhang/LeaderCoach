@@ -1,0 +1,29 @@
+{
+  "template_id": "T2_progress",
+  "budget_modifier": [1.05, 1.08],
+  "quality_2": true,
+  "notes": "进度周。primary_quality_2 以 optional 槽形态替换 sat 的一个 primary_easy（升级而非增课，课数守恒）。高强度占比 20–30%。",
+  "days": {
+    "mon": {"day_type": "single", "sessions": [
+      {"slot": "support_lower", "sport_id": "strength", "pattern": "squat", "pct": 8.7, "planned_rpe": 5, "planned_min": 50, "venue_need": "home_gym", "forbidden": [], "optional": false, "structure": null, "notes": "planned_rpe ≤6"}
+    ]},
+    "tue": {"day_type": "single", "sessions": [
+      {"slot": "primary_quality", "sport_id": "run", "pattern": "lower_impact", "pct": 21.3, "planned_rpe": 8, "planned_min": 75, "venue_need": null, "forbidden": [], "optional": false, "structure": "intervals", "notes": ""}
+    ]},
+    "wed": {"day_type": "double", "sessions": [
+      {"slot": "secondary_intensity", "sport_id": "climb", "pattern": "upper_pull_finger", "pct": 20.0, "planned_rpe": 7, "planned_min": 90, "venue_need": "climbing_gym", "forbidden": [], "optional": false, "structure": null, "notes": ""},
+      {"slot": "primary_easy", "sport_id": "run", "pattern": "lower_impact", "pct": 5.0, "planned_rpe": 3, "planned_min": 45, "venue_need": null, "forbidden": [], "optional": false, "structure": null, "notes": "攀强度在前"}
+    ]},
+    "thu": {"day_type": "rest_zero", "sessions": []},
+    "fri": {"day_type": "single", "sessions": [
+      {"slot": "secondary_volume", "sport_id": "climb", "pattern": "upper_pull_finger", "pct": 14.0, "planned_rpe": 5, "planned_min": 80, "venue_need": "climbing_gym", "forbidden": ["hangboard"], "optional": false, "structure": null, "notes": ""}
+    ]},
+    "sat": {"day_type": "double", "sessions": [
+      {"slot": "support_upper_core", "sport_id": "strength", "pattern": "pull", "pct": 7.3, "planned_rpe": 5, "planned_min": 40, "venue_need": "home_gym", "forbidden": [], "optional": false, "structure": null, "notes": ""},
+      {"slot": "primary_quality_2", "sport_id": "run", "pattern": "lower_impact", "pct": 5.0, "planned_rpe": 7, "planned_min": 45, "venue_need": null, "forbidden": [], "optional": true, "structure": "temporary_stimulus", "notes": "激活后该槽 planned_rpe=7、structure=临时刺激"}
+    ]},
+    "sun": {"day_type": "single", "sessions": [
+      {"slot": "primary_long", "sport_id": "run", "pattern": "lower_impact", "pct": 19.6, "planned_rpe": 4, "planned_min": 115, "venue_need": null, "forbidden": [], "optional": false, "structure": null, "notes": "primary_long +5%"}
+    ]}
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "template_id": "T5_taper",
+  "budget_modifier": [0.40, 0.60],
+  "notes": "赛前减量周（race_date 驱动）。固定网格，race 记为周日 event 标记（非槽位）。跑量 ×0.40–0.60；力量停；最后一次 ≥RPE6 刺激距 race ≥72h。",
+  "days": {
+    "mon": {"day_type": "rest_zero", "sessions": []},
+    "tue": {"day_type": "single", "sessions": [
+      {"slot": "primary_quality_short", "sport_id": "run", "pattern": "lower_impact", "pct": 8.0, "planned_rpe": 7, "planned_min": 40, "venue_need": null, "forbidden": [], "optional": false, "structure": "race_pace", "notes": "比赛配速短刺激"}
+    ]},
+    "wed": {"day_type": "double", "sessions": [
+      {"slot": "primary_easy", "sport_id": "run", "pattern": "lower_impact", "pct": 5.0, "planned_rpe": 3, "planned_min": 40, "venue_need": null, "forbidden": [], "optional": false, "structure": null, "notes": ""},
+      {"slot": "secondary_easy", "sport_id": "climb", "pattern": "upper_pull_finger", "pct": 5.0, "planned_rpe": 4, "planned_min": 40, "venue_need": "climbing_gym", "forbidden": ["hangboard", "intensity"], "optional": false, "structure": null, "notes": "攀 ≤RPE4"}
+    ]},
+    "thu": {"day_type": "single", "sessions": [
+      {"slot": "primary_easy", "sport_id": "run", "pattern": "lower_impact", "pct": 4.0, "planned_rpe": 3, "planned_min": 30, "venue_need": null, "forbidden": [], "optional": false, "structure": null, "notes": ""}
+    ]},
+    "fri": {"day_type": "rest_zero", "sessions": []},
+    "sat": {"day_type": "single", "sessions": [
+      {"slot": "primary_shakeout", "sport_id": "run", "pattern": "lower_impact", "pct": 2.0, "planned_rpe": 2, "planned_min": 20, "venue_need": null, "forbidden": [], "optional": true, "structure": null, "notes": "可选"}
+    ]},
+    "sun": {"day_type": "single", "sessions": [
+      {"slot": "race_event", "sport_id": "run", "pattern": "lower_impact", "pct": 0.0, "planned_rpe": null, "planned_min": null, "venue_need": null, "forbidden": [], "optional": false, "structure": "race", "notes": "RACE（事件标记，非槽位）"}
+    ]}
+  }
+}
