@@ -88,6 +88,11 @@ coach/      Prompt templates
 tests/      Engine and schema tests
 ```
 
+## Changelog
+
+- 2026-10-23: added `sync_garmin` (sync inside MCP); single-day HRV drop gates G4b/G4c with a user-chosen action; dual baseline (rolling-14 + Garmin reference).
+- 2026-10-21: first public release.
+
 ## License
 
 - Project code: MIT, see `LICENSE`;
