@@ -201,7 +201,26 @@ def evaluate_gates(ctx: dict, cfg: dict) -> list[dict]:
     hrv_hist = ctx.get("hrv_dev_history") or []
     persist = g["luteal_gate_persist_days"] if ctx.get("luteal_phase_confound") else g["hrv_gate_persist_days"]
     if len(hrv_hist) >= persist and all(v is not None and v <= g["hrv_dev_gate"] for v in hrv_hist[-persist:]):
-        gates.append({"gate": "G4", "action": "强度降级一档（HRV 连续偏离）"})
+        gates.append({"gate": "G4", "action": "强度降级一档（HRV 连续偏离）",
+                      "options": ["降级一档", "维持原计划", "改为轻松课"]})
+
+    # 单日骤降：熬夜、疾病、急性压力等非训练因素也会造成大幅下跌，
+    # 不能等「连续 2 天」才响应。
+    hrv_today = ctx.get("hrv_dev_today")
+    if hrv_today is None and hrv_hist:
+        hrv_today = hrv_hist[-1]
+    options = ["改为轻松课", "维持原计划", "视体感再定"]
+    if hrv_today is not None:
+        if hrv_today <= g["hrv_single_drop_easy"]:
+            gates.append({"gate": "G4c",
+                          "action": f"建议当日轻松课（HRV 单日骤降 {hrv_today:.1f}%）",
+                          "options": options,
+                          "user_choice_required": True})
+        elif hrv_today <= g["hrv_single_drop_down"]:
+            gates.append({"gate": "G4b",
+                          "action": f"建议强度降级一档（HRV 单日骤降 {hrv_today:.1f}%）",
+                          "options": options,
+                          "user_choice_required": True})
 
     rhr_hist = ctx.get("rhr_dev_history") or []
     fever = ctx.get("fever", False)

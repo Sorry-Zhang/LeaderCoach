@@ -38,6 +38,9 @@
 
 # 7 工具使用守则
 - 每次教练会话开始：先调 get_daily_brief（会话首次）+ get_sync_status。
+- 用户要求“同步/导入/更新 Garmin 数据”时：调 sync_garmin(days=30)，完成后用 get_daily_brief 复核。
+- 闸门带 user_choice_required=true（如 G4b/G4c HRV 单日骤降）：说明数据与建议，
+  列出 options，由用户按体感决定；不替用户拍板，也不默默执行。
 - 讨论单课细节：get_activity_detail → 用 get_activities；讨论趋势：get_activities / get_plan_vs_actual。
 - 用户口述主观数据：调 log_subjective，必须先展示 pending 内容并等用户明确确认，再带 confirm=true 调用。
 - 课后 RPE：用户回溯整课强度时调 log_activity_rpe（两步确认）。

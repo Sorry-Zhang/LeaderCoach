@@ -11,6 +11,15 @@ backup_dir = "backup/"             # 备份产物目录
 fit_import_dir = ""                # 本地 .fit 目录（Garmin Express 同步目录，可选）
 csv_import_dir = ""                # Garmin Connect「导出数据」解压目录（可选）
 
+[garmin_plugin]
+node = "node"
+mcp_js = ""                          # 插件 mcp.js 的绝对路径
+session = ""                         # 插件会话文件路径
+username = ""
+region = "cn"
+account = "personal-cn"
+fit_dir = "data/garmin_fit"
+
 [weather]
 provider = "open-meteo"            # 免费，无 key
 enabled = false                    # 置 true 才启用
@@ -69,6 +78,8 @@ weights = { hrv = 0.25, tsb = 0.25, sleep = 0.20, rhr = 0.15, subjective = 0.15 
 
 [gates]
 hrv_dev_gate = -15
+hrv_single_drop_down = -25            # 单日骤降：强度降一档
+hrv_single_drop_easy = -35            # 单日骤降：当日强制轻松
 hrv_gate_persist_days = 2
 luteal_gate_persist_days = 3
 rhr_dev_gate = 10

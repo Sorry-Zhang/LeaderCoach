@@ -53,6 +53,25 @@ def test_gate_G3_acwr():
     gates = evaluate_gates({"acwr": 1.8}, _cfg)
     assert any(g["gate"] == "G3" for g in gates)
 
+def test_gate_G4b_single_drop_down():
+    # 前一日正常（+5%），今日单日跌到 −30% → 建议降一档，且需用户选择
+    gates = evaluate_gates({"hrv_dev_history": [5.0, -30.0]}, _cfg)
+    g4b = next((g for g in gates if g["gate"] == "G4b"), None)
+    assert g4b is not None
+    assert g4b.get("user_choice_required") is True
+    assert g4b.get("options")
+    assert not any(g["gate"] == "G4c" for g in gates)
+
+def test_gate_G4c_single_drop_easy():
+    gates = evaluate_gates({"hrv_dev_history": [5.0, -41.0]}, _cfg)
+    g4c = next((g for g in gates if g["gate"] == "G4c"), None)
+    assert g4c is not None
+    assert g4c.get("user_choice_required") is True
+
+def test_gate_G4_no_false_positive():
+    gates = evaluate_gates({"hrv_dev_history": [-9.0]}, _cfg)
+    assert not any(g["gate"].startswith("G4") for g in gates)
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

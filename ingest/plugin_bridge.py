@@ -14,14 +14,16 @@ from mcp.client.stdio import stdio_client
 from core import db as dbmod
 from core.config import load_config
 
+_plugin_cfg = load_config().get("garmin_plugin", {})
+
 DEFAULTS = {
-    "node": os.environ.get("GARMIN_PLUGIN_NODE", "node"),
-    "mcp_js": os.environ.get("GARMIN_PLUGIN_MCP_JS", ""),
-    "session": os.environ.get("GARMIN_PLUGIN_SESSION", ""),
-    "username": os.environ.get("GARMIN_USERNAME", ""),
-    "region": os.environ.get("GARMIN_REGION", "cn"),
-    "account": os.environ.get("GARMIN_ACCOUNT", "personal-cn"),
-    "fit_dir": os.environ.get("GARMIN_FIT_DIR", "data/garmin_fit"),
+    "node": os.environ.get("GARMIN_PLUGIN_NODE") or _plugin_cfg.get("node", "node"),
+    "mcp_js": os.environ.get("GARMIN_PLUGIN_MCP_JS") or _plugin_cfg.get("mcp_js", ""),
+    "session": os.environ.get("GARMIN_PLUGIN_SESSION") or _plugin_cfg.get("session", ""),
+    "username": os.environ.get("GARMIN_USERNAME") or _plugin_cfg.get("username", ""),
+    "region": os.environ.get("GARMIN_REGION") or _plugin_cfg.get("region", "cn"),
+    "account": os.environ.get("GARMIN_ACCOUNT") or _plugin_cfg.get("account", "personal-cn"),
+    "fit_dir": os.environ.get("GARMIN_FIT_DIR") or _plugin_cfg.get("fit_dir", "data/garmin_fit"),
 }
 
 def _require_plugin_config() -> None:
@@ -71,7 +73,9 @@ async def _pull_daily(session, start: str, end: str) -> dict:
     for s, e in _chunks(start, end, 30):
         hrv = await _safe_call(session, "get_garmin_hrv_summaries",
                                {"startDate": s, "endDate": e}) or {}
-        for x in hrv.get("hrvSummaries", []):
+        for x in (hrv.get("hrvSummaries") or []):
+            if not isinstance(x, dict):
+                continue
             d = x.get("calendarDate")
             if d:
                 r = row(d)
@@ -82,7 +86,11 @@ async def _pull_daily(session, start: str, end: str) -> dict:
 
         sleep = await _safe_call(session, "get_garmin_sleep",
                                  {"startDate": s, "endDate": e}) or []
+        if not isinstance(sleep, list):
+            sleep = []
         for x in sleep:
+            if not isinstance(x, dict):
+                continue
             d = x.get("date")
             if d:
                 r = row(d)
@@ -94,7 +102,11 @@ async def _pull_daily(session, start: str, end: str) -> dict:
 
         hr = await _safe_call(session, "get_garmin_heart_rate",
                               {"startDate": s, "endDate": e}) or []
+        if not isinstance(hr, list):
+            hr = []
         for x in hr:
+            if not isinstance(x, dict):
+                continue
             d = x.get("date")
             if d:
                 row(d)["resting_hr"] = x.get("restingHR")
@@ -102,7 +114,11 @@ async def _pull_daily(session, start: str, end: str) -> dict:
     for s, e in _chunks(start, end, 7):
         stress = await _safe_call(session, "get_garmin_stress_summaries",
                                   {"startDate": s, "endDate": e}) or []
+        if not isinstance(stress, list):
+            stress = []
         for x in stress:
+            if not isinstance(x, dict):
+                continue
             d = x.get("calendarDate")
             v = (x.get("values") or {}).get("overallStressLevel")
             if d and v is not None:

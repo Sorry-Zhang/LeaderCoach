@@ -12,6 +12,15 @@ DEFAULTS: dict = {
         "fit_import_dir": "",
         "csv_import_dir": "",
     },
+    "garmin_plugin": {
+        "node": "node",
+        "mcp_js": "",
+        "session": "",
+        "username": "",
+        "region": "cn",
+        "account": "personal-cn",
+        "fit_dir": "data/garmin_fit",
+    },
     "weather": {
         "provider": "open-meteo",
         "enabled": False,
@@ -56,6 +65,8 @@ DEFAULTS: dict = {
     "gates": {
         "hrv_dev_gate": -15,
         "hrv_gate_persist_days": 2,
+        "hrv_single_drop_down": -25,
+        "hrv_single_drop_easy": -35,
         "luteal_gate_persist_days": 3,
         "rhr_dev_gate": 10,
         "rhr_gate_persist_days": 2,

@@ -44,26 +44,34 @@ def _load_series(conn, end_day: date, lookback: int = 120) -> list[float]:
         d += timedelta(days=1)
     return series
 
-def _rolling_dev(conn, table_col: str, end_day: date, window: int = 14) -> list[tuple[str, float | None]]:
+def _rolling_dev(conn, table_col: str, end_day: date, window: int = 14,
+                 ref_col: str | None = None) -> list[tuple[str, float | None, float | None]]:
+    """返回 [(date, 主偏离%, 参考偏离%)]。
+
+    主偏离用轮动 window 天均值作基线；参考偏离用 ref_col（如 Garmin balanced）
+    作基线，仅作对照，不参与闸门判定。
+    """
     start = end_day - timedelta(days=window * 2)
+    cols = f"{table_col} AS v" + (f", {ref_col} AS ref" if ref_col else "")
     rows = conn.execute(
-        f"SELECT date, {table_col} AS v FROM daily_metrics WHERE date >= ? AND date <= ? ORDER BY date",
+        f"SELECT date, {cols} FROM daily_metrics WHERE date >= ? AND date <= ? ORDER BY date",
         (_iso(start), _iso(end_day)),
     ).fetchall()
-    vals = [(r["date"], r["v"]) for r in rows if r["v"] is not None]
+    vals = [(r["date"], r["v"], r["ref"] if ref_col else None) for r in rows
+            if r["v"] is not None]
     out = []
-    for i, (d, v) in enumerate(vals):
-        prior = [x for _, x in vals[max(0, i - window):i] if x is not None]
+    for i, (d, v, ref) in enumerate(vals):
+        prior = [x[1] for x in vals[max(0, i - window):i] if x[1] is not None]
+        dev = None
         if prior:
             base = sum(prior) / len(prior)
             dev = round((v - base) / base * 100, 2) if base else None
-        else:
-            dev = None
-        out.append((d, dev))
+        ref_dev = round((v - ref) / ref * 100, 2) if ref else None
+        out.append((d, dev, ref_dev))
     return out
 
 def _metric_dev_series(conn, end_day: date) -> tuple[list, list]:
-    hrv = _rolling_dev(conn, "hrv_last_night", end_day)
+    hrv = _rolling_dev(conn, "hrv_last_night", end_day, ref_col="hrv_baseline")
     rhr = _rolling_dev(conn, "resting_hr", end_day)
     return hrv, rhr
 
@@ -93,10 +101,11 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
     sub = conn.execute("SELECT * FROM subjective WHERE date=?", (day,)).fetchone()
 
     hrv_series, rhr_series = _metric_dev_series(conn, end)
-    hrv_dev = next((dev for d, dev in hrv_series if d == day), None)
-    rhr_dev = next((dev for d, dev in rhr_series if d == day), None)
-    hrv_dev_hist = [dev for _, dev in hrv_series if dev is not None]
-    rhr_dev_hist = [dev for _, dev in rhr_series if dev is not None]
+    hrv_dev = next((dev for d, dev, _ in hrv_series if d == day), None)
+    hrv_dev_ref = next((ref for d, _, ref in hrv_series if d == day), None)
+    rhr_dev = next((dev for d, dev, _ in rhr_series if d == day), None)
+    hrv_dev_hist = [dev for _, dev, _ in hrv_series if dev is not None]
+    rhr_dev_hist = [dev for _, dev, _ in rhr_series if dev is not None]
 
     sleep_h = dm["sleep_hours"] if dm else None
     soreness = sub["soreness"] if sub else None
@@ -136,6 +145,7 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
     gates_ctx = {
         "tsb": tsb, "acwr": acwr, "readiness": readiness["score"],
         "sleep_hours": sleep_h, "hrv_dev_history": hrv_dev_hist,
+        "hrv_dev_today": hrv_dev,
         "rhr_dev_history": rhr_dev_hist,
         "luteal_phase_confound": cycle_flags.get("luteal_phase_confound", False),
         "injury_active": injury_active, "red_s_active": red_s_active,
@@ -179,6 +189,7 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
     row["gates_triggered"] = gates
     row["flags"] = flags
     row["hrv_dev_pct"] = hrv_dev
+    row["hrv_dev_ref_pct"] = hrv_dev_ref
     row["rhr_dev_pct"] = rhr_dev
     return row
 
@@ -224,6 +235,9 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
             },
             "hrv_last_night": dm["hrv_last_night"] if dm else None,
             "hrv_dev_pct": eng.get("hrv_dev_pct"),
+            "hrv_dev_ref_pct": eng.get("hrv_dev_ref_pct"),
+            "hrv_baseline_source": "rolling14",
+            "hrv_ref_source": "garmin_balanced",
             "resting_hr": dm["resting_hr"] if dm else None,
             "stress_daily_avg": dm["stress_daily_avg"] if dm else None,
             "data_status": dm["data_status"] if dm else "missing",

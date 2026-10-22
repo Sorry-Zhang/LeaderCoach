@@ -185,6 +185,61 @@ def get_sync_status() -> dict:
     finally:
         conn.close()
 
+def _run_sync_blocking(days: int, download_fit: bool):
+    """在独立线程中执行同步：MCP 工具运行在事件循环内，不能直接 asyncio.run。"""
+    import threading
+
+    from ingest import plugin_bridge
+
+    end = date.today()
+    start = end - timedelta(days=max(1, days))
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["result"] = plugin_bridge.run(
+                start.isoformat(), end.isoformat(), 100, download_fit, True,
+                plugin_bridge.DEFAULTS["node"], plugin_bridge.DEFAULTS["mcp_js"],
+                plugin_bridge.DEFAULTS["session"], plugin_bridge.DEFAULTS["username"],
+                plugin_bridge.DEFAULTS["region"], plugin_bridge.DEFAULTS["account"],
+                plugin_bridge.DEFAULTS["fit_dir"])
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = f"{type(e).__name__}: {e}"
+
+    th = threading.Thread(target=_worker, daemon=True)
+    th.start()
+    th.join(timeout=300)
+    if th.is_alive():
+        raise TimeoutError("Garmin 同步超过 300 秒未完成")
+    if "error" in box:
+        raise RuntimeError(box["error"])
+    return box["result"]
+
+
+@mcp.tool()
+def sync_garmin(days: int = 30, download_fit: bool = False) -> dict:
+    """从 Garmin 插件拉取最近 N 天的活动与每日生理数据，写入本地数据库。"""
+    daily, acts, inserted = _run_sync_blocking(days, download_fit)
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('last_sync_at',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (datetime.now().isoformat(timespec="seconds"),))
+        conn.commit()
+        hrv_days = conn.execute(
+            "SELECT COUNT(*) c FROM daily_metrics WHERE hrv_last_night IS NOT NULL"
+        ).fetchone()["c"]
+        sleep_days = conn.execute(
+            "SELECT COUNT(*) c FROM daily_metrics WHERE sleep_hours IS NOT NULL"
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    return {"requested_days": days, "daily_days": len(daily),
+            "activities_listed": len(acts), "activities_inserted": inserted,
+            "hrv_days_total": hrv_days, "sleep_days_total": sleep_days}
+
+
 @mcp.tool()
 def get_activities(date_range: int = 14, sport_id: Optional[str] = None) -> list:
     conn = _conn()
