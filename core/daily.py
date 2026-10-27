@@ -7,10 +7,12 @@ from .engine import (
     compute_fitness,
     compute_acwr,
     compute_readiness,
-    evaluate_gates,
+    evaluate_training_forecast,
     evaluate_reds,
 )
 from . import cycle as cyclemod
+from . import sleep_health
+from . import store_ext
 
 def _iso(d) -> str:
     return d.isoformat()
@@ -49,7 +51,7 @@ def _rolling_dev(conn, table_col: str, end_day: date, window: int = 14,
     """返回 [(date, 主偏离%, 参考偏离%)]。
 
     主偏离用轮动 window 天均值作基线；参考偏离用 ref_col（如 Garmin balanced）
-    作基线，仅作对照，不参与闸门判定。
+    作基线，仅作对照，不参与训练预测判定。
     """
     start = end_day - timedelta(days=window * 2)
     cols = f"{table_col} AS v" + (f", {ref_col} AS ref" if ref_col else "")
@@ -111,8 +113,18 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
     soreness = sub["soreness"] if sub else None
     sleep_feel = sub["sleep_feel"] if sub else None
 
+    # 睡眠状态分：把睡眠折算成「今天恢复到什么程度」，替代单一时长阈值
+    try:
+        sleep_state = sleep_health.evaluate(conn, cfg, day, sleep_feel)
+    except Exception:  # noqa: BLE001
+        sleep_state = {"date": day, "score": None, "confidence": "low", "dimensions": {},
+                       "personal_need_h": None, "notes": ["睡眠模块计算失败"]}
+    sleep_state["percentile_28d"] = sleep_health.percentile(conn, day, sleep_state.get("score"))
+    sleep_state["g8"] = sleep_health.g8_status(conn, cfg, day, sleep_state.get("score"))
+
     weights = cfg["readiness"]["weights"]
-    readiness = compute_readiness(hrv_dev, tsb, sleep_h, rhr_dev, soreness, sleep_feel, weights)
+    readiness = compute_readiness(hrv_dev, tsb, sleep_h, rhr_dev, soreness, sleep_feel, weights,
+                                  sleep_score=sleep_state.get("score"))
 
     cycle_flags = _cycle_flags(conn, end, cfg)
 
@@ -142,16 +154,19 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
         except Exception:
             pass
 
-    gates_ctx = {
+    forecast_ctx = {
         "tsb": tsb, "acwr": acwr, "readiness": readiness["score"],
-        "sleep_hours": sleep_h, "hrv_dev_history": hrv_dev_hist,
+        "sleep_hours": sleep_h, "sleep_state_score": sleep_state.get("score"),
+        "sleep_g8_mode": sleep_state["g8"]["mode"],
+        "sleep_g8_enforced": sleep_state["g8"]["enforced"],
+        "hrv_dev_history": hrv_dev_hist,
         "hrv_dev_today": hrv_dev,
         "rhr_dev_history": rhr_dev_hist,
         "luteal_phase_confound": cycle_flags.get("luteal_phase_confound", False),
         "injury_active": injury_active, "red_s_active": red_s_active,
         "cramps_today": cramps,
     }
-    gates = evaluate_gates(gates_ctx, cfg)
+    forecast = evaluate_training_forecast(forecast_ctx, cfg)
 
     reds_ctx = {
         "hrv_dev_history": hrv_dev_hist, "rhr_dev_history": rhr_dev_hist,
@@ -171,8 +186,9 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
         "ewma7": ewma7, "ewma28": ewma28,
         "readiness_score": readiness["score"], "readiness_confidence": readiness["confidence"],
         "pillars": json.dumps(readiness["pillars"], ensure_ascii=False),
-        "inputs_used": json.dumps(gates_ctx, ensure_ascii=False, default=str),
-        "gates_triggered": json.dumps(gates, ensure_ascii=False),
+        "inputs_used": json.dumps(forecast_ctx, ensure_ascii=False, default=str),
+        # 列名沿用 v1.7 的 gates_triggered（历史兼容），内容即训练预测项
+        "gates_triggered": json.dumps(forecast, ensure_ascii=False),
         "flags": json.dumps(flags, ensure_ascii=False),
         "param_version": cfg["_root"] and "p2026-10",
         "calc_version": "1.3",
@@ -185,8 +201,27 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
         [row[c] for c in cols],
     )
     conn.commit()
+    # 睡眠状态分入 garmin_metrics，便于算个人百分位与趋势
+    if sleep_state.get("score") is not None:
+        try:
+            metrics = {"sleep_state_score": sleep_state["score"]}
+            for k, v in (sleep_state.get("dimensions") or {}).items():
+                if v is not None:
+                    metrics[f"sleep_dim_{k}"] = v
+            for k in ("sri", "midpoint_dev_h", "debt_7d_h", "efficiency_pct", "waso_min"):
+                if sleep_state.get(k) is not None:
+                    metrics[f"sleep_{k}"] = sleep_state[k]
+            g8 = sleep_state.get("g8") or {}
+            metrics["sleep_g8_p10"] = g8.get("p10")
+            metrics["sleep_g8_threshold"] = g8.get("threshold")
+            metrics["sleep_g8_triggered"] = 1.0 if g8.get("triggered") else 0.0
+            metrics["sleep_g8_enforced"] = 1.0 if g8.get("enforced") else 0.0
+            store_ext.upsert_metrics(conn, day, metrics)
+        except Exception:  # noqa: BLE001
+            pass
     row["pillars"] = readiness["pillars"]
-    row["gates_triggered"] = gates
+    row["training_forecast"] = forecast
+    row["sleep_health"] = sleep_state
     row["flags"] = flags
     row["hrv_dev_pct"] = hrv_dev
     row["hrv_dev_ref_pct"] = hrv_dev_ref
@@ -233,6 +268,11 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
                 "rem": dm["sleep_rem_h"] if dm else None,
                 "awake": dm["sleep_awake_h"] if dm else None,
             },
+            "sleep_window": {
+                "start": dm["sleep_start"] if dm else None,
+                "end": dm["sleep_end"] if dm else None,
+                "mid": dm["sleep_mid"] if dm else None,
+            },
             "hrv_last_night": dm["hrv_last_night"] if dm else None,
             "hrv_dev_pct": eng.get("hrv_dev_pct"),
             "hrv_dev_ref_pct": eng.get("hrv_dev_ref_pct"),
@@ -241,7 +281,14 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
             "resting_hr": dm["resting_hr"] if dm else None,
             "stress_daily_avg": dm["stress_daily_avg"] if dm else None,
             "data_status": dm["data_status"] if dm else "missing",
+            # v1.8：插件全量采集的明细（无数据时为 None，不臆造）
+            "sleep_detail": _sleep_detail(conn, day),
+            "overnight_series": _overnight_summary(conn, day),
+            "garmin_official": _garmin_metrics(conn, day),
+            # v1.9：睡眠状态分（个人基线；决定当天训练安排的主要睡眠依据）
+            "sleep_health": eng.get("sleep_health"),
         },
+        "data_extensions": {"schema": "v1.9-ext", "engine": "1.3"},
         "cycle": {
             "phase": cycle["phase"], "cycle_day": cycle["cycle_day"],
             "days_to_predicted_period": cycle["days_to_predicted_period"],
@@ -253,7 +300,7 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
             "confidence": eng["readiness_confidence"],
             "pillars": eng["pillars"],
             "ctl": eng["ctl"], "atl": eng["atl"], "tsb": eng["tsb"], "acwr": eng["acwr"],
-            "gates_triggered": eng["gates_triggered"], "flags": eng["flags"],
+            "training_forecast": eng["training_forecast"], "flags": eng["flags"],
         },
         "recent_activities": recent,
         "strength_sessions": strength,
@@ -267,7 +314,7 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
         "plan_context": plan_ctx,
         "data_quality": {
             "hr_source": _hr_source(conn),
-            "feeding": {"subjective_streak_days": streak, "last_input": last_input,
+            "logging": {"subjective_streak_days": streak, "last_input": last_input,
                         "escalation_level": escalation},
             "obs_state_notes": [],
             "notes": [],
@@ -288,7 +335,7 @@ def _streak_days(conn, day: str) -> int:
     return n
 
 def _escalation(conn, cfg: dict, day: str, streak: int) -> str:
-    f = cfg["feeding"]
+    f = cfg["logging"]
     if streak >= f["l3_subjective_days"]:
         return "L3"
     if streak >= f["l2_subjective_days"]:
@@ -334,3 +381,71 @@ def _meso_states(conn) -> dict:
     rows = conn.execute(
         "SELECT sport_id, mesocycle_state FROM sport_registry WHERE active=1").fetchall()
     return {r["sport_id"]: r["mesocycle_state"] for r in rows}
+
+
+# ── v1.8：插件全量数据的摘要（表不存在或没有数据时一律返回 None） ─────────
+
+def _sleep_detail(conn, day: str) -> dict | None:
+    """夜间分段：只给"何时进入深睡/REM、醒了几次"这类教练需要的事件级摘要。"""
+    try:
+        rows = conn.execute(
+            "SELECT stage, start_local, end_local, seconds FROM sleep_stages "
+            "WHERE date=? ORDER BY seq", (day,)).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows:
+        return None
+    counts, firsts = {}, {}
+    for r in rows:
+        counts[r["stage"]] = counts.get(r["stage"], 0) + 1
+        firsts.setdefault(r["stage"], r["start_local"])
+    longest_deep = max((r for r in rows if r["stage"] == "deep"), key=lambda r: r["seconds"], default=None)
+    last = rows[-1]
+    return {
+        "sleep_start": rows[0]["start_local"],
+        "sleep_end": last["end_local"],
+        "segments": len(rows),
+        "segment_count_by_stage": counts,
+        "first_deep": firsts.get("deep"),
+        "first_rem": firsts.get("rem"),
+        "longest_deep_min": round(longest_deep["seconds"] / 60) if longest_deep else None,
+        "awake_segments": counts.get("awake", 0),
+        "awake_min": round(sum(r["seconds"] for r in rows if r["stage"] == "awake") / 60, 1),
+    }
+
+
+def _overnight_summary(conn, day: str) -> dict | None:
+    """夜间分钟级序列的汇总（心率/压力/身体电量/HRV/呼吸）。"""
+    try:
+        rows = conn.execute(
+            "SELECT kind, MIN(value), MAX(value), ROUND(AVG(value), 1), COUNT(*) "
+            "FROM sleep_series WHERE date=? GROUP BY kind", (day,)).fetchall()
+        hrv = conn.execute(
+            "SELECT COUNT(*), MIN(hrv_value), MAX(hrv_value), ROUND(AVG(hrv_value), 1) "
+            "FROM hrv_readings WHERE date=?", (day,)).fetchone()
+        stress = conn.execute(
+            "SELECT COUNT(*) FROM stress_series WHERE date=?", (day,)).fetchone()[0]
+        battery = conn.execute(
+            "SELECT COUNT(*) FROM body_battery_series WHERE date=?", (day,)).fetchone()[0]
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows and (not hrv or hrv[0] == 0):
+        return None
+    out = {"series": {r[0]: {"min": r[1], "max": r[2], "avg": r[3], "points": r[4]} for r in rows}}
+    if hrv and hrv[0]:
+        out["hrv_readings"] = {"points": hrv[0], "min": hrv[1], "max": hrv[2], "avg": hrv[3]}
+    out["day_stress_points"] = stress
+    out["body_battery_points"] = battery
+    return out
+
+
+def _garmin_metrics(conn, day: str) -> dict | None:
+    """Garmin 官方指标（隔离层：只作为参考，不参与自算准备度）。"""
+    try:
+        rows = conn.execute(
+            "SELECT metric, value, unit FROM garmin_metrics WHERE date=?", (day,)).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows:
+        return None
+    return {r["metric"]: r["value"] for r in rows}

@@ -46,7 +46,7 @@ def select_template(state: dict, cfg: dict) -> dict:
         return {"template_id": "T1_base", "t4_level": None}
     if (completion is not None and completion >= cfg["templates"]["completion_t2_threshold"]
             and state.get("acwr_band") == "green"
-            and not state.get("gate_history")):
+            and not (state.get("forecast_history") or state.get("gate_history"))):
         return {"template_id": "T2_progress", "t4_level": None}
     return {"template_id": "T1_base", "t4_level": None}
 

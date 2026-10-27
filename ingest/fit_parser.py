@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 _SPORT_MAP = {
@@ -117,3 +118,132 @@ def parse_fit(path) -> dict:
         "indoor": None,
         "annotation": None,
     }
+
+
+# ── 运动分段：lap（手动/自动圈）与 1 km 自动分段 → activity_splits ─────────
+
+def extract_splits(path) -> dict:
+    """解析一个活动 FIT 的分段信息。
+
+    返回 {"start_time": "YYYY-MM-DD HH:MM:SS",
+          "laps": [{idx, distance_m, timer_s, avg_hr, max_hr, ascent_m, start_time}],
+          "km_splits": [{km, pace_min_km, avg_hr, elevation_gain_m}]}
+    """
+    try:
+        import fitdecode
+    except ImportError as e:
+        raise RuntimeError("缺少 fitdecode，请执行：pip install fitdecode") from e
+
+    laps, records, session = [], [], {}
+    with fitdecode.FitReader(str(path)) as fit:
+        for frame in fit:
+            if getattr(frame, "frame_type", None) != fitdecode.FIT_FRAME_DATA:
+                continue
+            name = getattr(frame, "name", "")
+            fields = _frame_fields(frame)
+            if name == "session":
+                session.update(fields)
+            elif name == "lap":
+                laps.append(fields)
+            elif name == "record":
+                records.append(fields)
+
+    st = session.get("start_time")
+    if hasattr(st, "astimezone"):
+        from datetime import timedelta, timezone
+        st = st.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+    lap_rows = []
+    for i, l in enumerate(laps):
+        ls = l.get("start_time")
+        if hasattr(ls, "astimezone"):
+            from datetime import timedelta, timezone
+            ls = ls.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        lap_rows.append({
+            "idx": i,
+            "distance_m": l.get("total_distance"),
+            "timer_s": l.get("total_timer_time"),
+            "avg_hr": l.get("avg_heart_rate"),
+            "max_hr": l.get("max_heart_rate"),
+            "ascent_m": l.get("total_ascent"),
+            "start_time": ls,
+        })
+
+    # 1 km 自动分段：按累计距离切分 record
+    km_rows = []
+    km = 1
+    seg_start_t = seg_start_hr_sum = None
+    hr_vals, seg_count = [], 0
+    seg_start_d = None
+    for r in sorted(records, key=lambda x: (x.get("timestamp") is None, x.get("timestamp"))):
+        d = r.get("distance")
+        t = r.get("timestamp")
+        hr = r.get("heart_rate")
+        if d is None or t is None:
+            continue
+        if seg_start_d is None:
+            seg_start_d, seg_start_t = d, t
+        if hr is not None:
+            hr_vals.append(hr)
+        if d - seg_start_d >= 1000:
+            secs = (t - seg_start_t).total_seconds()
+            km_rows.append({
+                "km": km,
+                "pace_min_km": round(secs / 60, 3) if secs > 0 else None,
+                "avg_hr": round(sum(hr_vals) / len(hr_vals)) if hr_vals else None,
+                "elevation_gain_m": None,
+            })
+            km += 1
+            seg_start_d, seg_start_t, hr_vals = d, t, []
+    return {"start_time": st, "laps": lap_rows, "km_splits": km_rows}
+
+
+def rebuild_splits(cfg, files, conn=None) -> int:
+    """把 FIT 分段写进 activity_splits（activity_splits 在 v1.7 里用 km 作分段键，
+    有 laps 时写入圈序号，否则用 1 km 自动分段）。返回写入的分段条数。"""
+    from core import db as dbmod
+    own = conn is None
+    try:
+        conn = conn or dbmod.get_conn(cfg)
+        n = 0
+        for f in files:
+            try:
+                info = extract_splits(f)
+            except Exception:
+                continue
+            if not info["start_time"]:
+                continue
+            name = Path(f).name
+            act = conn.execute(
+                "SELECT id, fit_path FROM activities WHERE fit_path LIKE ? "
+                "OR ABS(julianday(substr(start_time,1,19)) - julianday(?)) < 1.0/1440 "
+                "ORDER BY (fit_path LIKE ?) DESC LIMIT 1",
+                (f"%{name}", info["start_time"], f"%{name}")).fetchone()
+            if not act:
+                continue
+            conn.execute("DELETE FROM activity_splits WHERE activity_id=?", (act["id"],))
+            rows = []
+            if info["laps"]:
+                for l in info["laps"]:
+                    secs, dist = l["timer_s"], l["distance_m"]
+                    pace = round((secs / 60) / (dist / 1000), 3) if secs and dist else None
+                    rows.append((act["id"], l["idx"] + 1, pace, l["avg_hr"], l["ascent_m"]))
+            else:
+                for k in info["km_splits"]:
+                    rows.append((act["id"], k["km"], k["pace_min_km"], k["avg_hr"], None))
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO activity_splits(activity_id, km, pace_min_km, avg_hr, "
+                    "elevation_gain_m) VALUES(?,?,?,?,?)", rows)
+            # 圈级明细（含每圈起止时刻/计时时长）存进 activities.annotation 的 splits 字段
+            if act["fit_path"]:
+                detail = json.dumps({"fit": str(f), "laps": info["laps"], "km": info["km_splits"]},
+                                    ensure_ascii=False)
+                conn.execute("UPDATE activities SET annotation=? WHERE id=?",
+                             (detail, act["id"]))
+            n += len(rows)
+        conn.commit()
+        return n
+    finally:
+        if own and conn is not None:
+            conn.close()

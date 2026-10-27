@@ -28,23 +28,33 @@ def athlete_profile(conn) -> dict:
         return {}
     return {k: r[k] for k in r.keys() if k != "id"}
 
-def gates_table(cfg: dict) -> str:
+def forecast_table(cfg: dict) -> str:
+    """训练预测项清单：条件与动作都从配置读，避免文档和引擎各说一套。"""
+    f = cfg["fitness"]
+    t = cfg["training_forecast"]
+    s_cfg = cfg.get("sleep") or {}
     rows = [
-        ("G1", "TSB ≤ −100", "当日强制轻松课"),
-        ("G2", "TSB ≤ −170", "休息日"),
-        ("G3", "ACWR > 1.5", "质量课冻结（当日+次日）"),
-        ("G4", "HRV dev ≤ −15% 连续 2 天", "强度降级一档"),
-        ("G5", "RHR dev ≥ +10% 连续 2 天 或发热", "疾病协议（休息）"),
+        ("G1", f"TSB ≤ {f['tsb_soft_gate']}", "当日只安排轻松课"),
+        ("G2", f"TSB ≤ {f['tsb_hard_gate']}", "休息日"),
+        ("G3", f"ACWR > {cfg['acwr']['freeze_threshold']}", "质量课冻结（当日+次日）"),
+        ("G4", f"HRV 偏离 ≤ {t['hrv_dev_threshold']}% 连续 {t['hrv_persist_days']} 天", "强度降级一档"),
+        ("G4b", f"HRV 单日骤降 ≤ {t['hrv_single_drop_down']}%", "建议降级（用户选择）"),
+        ("G4c", f"HRV 单日骤降 ≤ {t['hrv_single_drop_easy']}%", "建议轻松课（用户选择）"),
+        ("G5", f"静息心率偏离 ≥ +{t['rhr_dev_threshold']}% 连续 {t['rhr_persist_days']} 天 或发热",
+         "疾病方案（休息）"),
         ("G6", "伤病旗/active 约束", "禁跑 + 按伤位限制"),
-        ("G7", "readiness < 40", "默认轻松日"),
-        ("G8", "睡眠 < 5h", "当日无质量课"),
-        ("G9", "RED-S active", "负荷−20~30% + 蛋白质 1.8–2.2 g/kg"),
-        ("G10", "痛经 cramps ≥7/10", "当日强制轻松课"),
+        ("G7", f"准备度 < {t['readiness_easy_floor']}", "默认轻松日"),
+        ("G8", f"睡眠状态分 < min(个人 p10, {s_cfg.get('g8_absolute_floor', 60)})"
+               f"（当前 {s_cfg.get('g8_mode', 'observe')}）",
+         "enforce 时当日不排质量课；observe 只记录"),
+        ("G9", "RED-S active", "负荷 −20~30% + 蛋白质 1.8–2.2 g/kg"),
+        ("G10", "痛经 cramps ≥7/10", "当日只安排轻松课"),
     ]
-    lines = ["| 闸门 | 条件 | 动作 |", "|---|---|---|"]
+    lines = ["| 预测项 | 条件 | 动作 |", "|---|---|---|"]
     for g, c, a in rows:
         lines.append(f"| {g} | {c} | {a} |")
     return "\n".join(lines)
+
 
 def interference_matrix() -> str:
     return """- 下肢大重量（squat/hinge，RPE≥7）→ 跑步质量课：间隔 24h
@@ -61,7 +71,7 @@ def weekly_constraints() -> str:
 - 周预算 = 7 × CTL × 模板 modifier，上限 ≤ 7×CTL×1.08。
 - 每周 ≥1 个零负荷日（day_type=rest_zero）。
 - 质量课 ≤3/周（减脂 ≤2）；低强度占比 ≥75%。
-- 完成率口径：闸门豁免后口径（撤课不入分母）。"""
+- 完成率口径：预测豁免后口径（撤课不入分母）。"""
 
 def build_system_prompt(cfg: dict, conn) -> str:
     tpl = (Path(cfg["_root"]) / "coach" / "system_prompt.md.j2").read_text(encoding="utf-8")
@@ -73,6 +83,6 @@ def build_system_prompt(cfg: dict, conn) -> str:
             .replace("{{PARAM_VERSION}}", "p2026-10")
             .replace("{{ATHLETE_PROFILE_JSON}}", json.dumps(ap, ensure_ascii=False, indent=2))
             .replace("{{CAPABILITY_MATRIX_JSON}}", json.dumps(cm, ensure_ascii=False, indent=2))
-            .replace("{{GATES_TABLE}}", gates_table(cfg))
+            .replace("{{GATES_TABLE}}", forecast_table(cfg))
             .replace("{{INTERFERENCE_MATRIX}}", interference_matrix())
             .replace("{{WEEKLY_CONSTRAINTS}}", weekly_constraints()))

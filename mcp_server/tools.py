@@ -38,7 +38,7 @@ def _upgrade_s2(conn) -> bool:
         "SELECT 1 FROM injury_history WHERE status IN ('active','restricted') LIMIT 1").fetchone()
     return row is not None
 
-def _recent_gates(conn) -> list[str]:
+def _recent_forecast(conn) -> list[str]:
     row = conn.execute(
         "SELECT gates_triggered FROM engine_daily ORDER BY date DESC LIMIT 1").fetchone()
     if not row or not row["gates_triggered"]:
@@ -90,11 +90,11 @@ def _validation_ctx(conn, week_start: str) -> dict:
     band = acwr_band(acwr, _cfg) if acwr is not None else "green"
     return {
         "chronic_load": ctl, "prev_week_load": round(prev, 1), "cut_mode": cut_mode,
-        "gates_active": _recent_gates(conn), "acwr_band": band, "acwr": acwr,
+        "forecast_hits": _recent_forecast(conn), "acwr_band": band, "acwr": acwr,
         "injury_constraints": inj, "mesocycle_states": meso, "maintenance_floor": floor,
         "template_target_au": None, "week_index_in_block": None, "block_reduced": False,
         "cycle_heavy_flow_dates": set(), "history_heavy_cramps": False,
-        "below_floor_prev_week": False, "gate_load_reduced": False,
+        "below_floor_prev_week": False, "forecast_load_reduced": False,
     }
 
 @mcp.tool()
@@ -174,52 +174,89 @@ def get_sync_status() -> dict:
     try:
         last_sync = conn.execute("SELECT value FROM meta WHERE key='last_sync_at'").fetchone()
         brief = dailymod.build_daily_brief(conn, _cfg)
-        feeding = brief["data_quality"]["feeding"]
+        logging = brief["data_quality"]["logging"]
+        from core import store_ext
         return {
             "last_sync_at": last_sync["value"] if last_sync else None,
-            "feeding": feeding,
+            "logging": logging,
             "obs_state": conn.execute("SELECT value FROM meta WHERE key='obs_state'").fetchone(),
             "activity_count": conn.execute("SELECT COUNT(*) c FROM activities").fetchone()["c"],
             "strength_count": conn.execute("SELECT COUNT(*) c FROM strength_sessions").fetchone()["c"],
+            "coverage": store_ext.stats(conn),
         }
     finally:
         conn.close()
 
-def _run_sync_blocking(days: int, download_fit: bool):
-    """在独立线程中执行同步：MCP 工具运行在事件循环内，不能直接 asyncio.run。"""
+def _run_sync_blocking(days: int, download_fit: bool, full: bool = True):
+    """在独立线程中执行同步：MCP 工具运行在事件循环内，不能直接 asyncio.run。
+
+    full=True 走 ingest.plugin_full（插件全部只读工具 + 原始存档）；
+    full=False 或全量失败时回退到 ingest.plugin_bridge（旧的最小采集路径）。
+    """
     import threading
 
-    from ingest import plugin_bridge
+    from core.config import get as cfg_get
+    from ingest import plugin_full
 
+    full = bool(full) and bool(cfg_get(_cfg, "garmin_plugin.full_sync", True))
     end = date.today()
-    start = end - timedelta(days=max(1, days))
+    start = end - timedelta(days=max(1, days) - 1)
     box: dict = {}
+
+    def _full():
+        return plugin_full.run(
+            start.isoformat(), end.isoformat(), 1, download_fit,
+            plugin_full.DEFAULTS["node"], plugin_full.DEFAULTS["mcp_js"],
+            plugin_full.DEFAULTS["session"], plugin_full.DEFAULTS["username"],
+            plugin_full.DEFAULTS["region"], plugin_full.DEFAULTS["account"],
+            plugin_full.DEFAULTS["fit_dir"])
+
+    def _legacy():
+        from ingest import plugin_bridge
+        daily, acts, inserted = plugin_bridge.run(
+            start.isoformat(), end.isoformat(), 100, download_fit, True,
+            plugin_bridge.DEFAULTS["node"], plugin_bridge.DEFAULTS["mcp_js"],
+            plugin_bridge.DEFAULTS["session"], plugin_bridge.DEFAULTS["username"],
+            plugin_bridge.DEFAULTS["region"], plugin_bridge.DEFAULTS["account"],
+            plugin_bridge.DEFAULTS["fit_dir"])
+        return {"mode": "legacy", "daily_days": len(daily), "activities_listed": len(acts),
+                "activities_inserted": inserted}
 
     def _worker():
         try:
-            box["result"] = plugin_bridge.run(
-                start.isoformat(), end.isoformat(), 100, download_fit, True,
-                plugin_bridge.DEFAULTS["node"], plugin_bridge.DEFAULTS["mcp_js"],
-                plugin_bridge.DEFAULTS["session"], plugin_bridge.DEFAULTS["username"],
-                plugin_bridge.DEFAULTS["region"], plugin_bridge.DEFAULTS["account"],
-                plugin_bridge.DEFAULTS["fit_dir"])
+            if full:
+                try:
+                    box["result"] = _full()
+                    box["result"]["mode"] = "full"
+                    return
+                except BaseException as e:  # noqa: BLE001
+                    box["full_error"] = f"{type(e).__name__}: {e}"
+            box["result"] = _legacy()
         except BaseException as e:  # noqa: BLE001
             box["error"] = f"{type(e).__name__}: {e}"
 
     th = threading.Thread(target=_worker, daemon=True)
     th.start()
-    th.join(timeout=300)
+    th.join(timeout=1800)
     if th.is_alive():
-        raise TimeoutError("Garmin 同步超过 300 秒未完成")
+        raise TimeoutError("Garmin 同步超过 1800 秒未完成")
     if "error" in box:
         raise RuntimeError(box["error"])
-    return box["result"]
+    return box
 
 
 @mcp.tool()
-def sync_garmin(days: int = 30, download_fit: bool = False) -> dict:
-    """从 Garmin 插件拉取最近 N 天的活动与每日生理数据，写入本地数据库。"""
-    daily, acts, inserted = _run_sync_blocking(days, download_fit)
+def sync_garmin(days: int = 30, download_fit: bool = False, full: bool = True) -> dict:
+    """从 Garmin 插件拉取最近 N 天的数据并写入本地数据库。
+
+    full=True（默认）调用插件的**全部只读工具**：活动（完整详情）、睡眠、心率、步数、体重、
+    HRV 摘要与夜间读数、压力/身体电量时序、训练准备度、训练状态、负荷平衡、VO2max、
+    比赛预测、训练库、个人资料；原始返回 gzip 存档到 archive/plugin_raw；另用本地 FIT 回填
+    运动分段（lap/1km）。睡眠阶段时间线来自 SDK 直读（插件 get_garmin_sleep 不含）。
+    full=False 走旧的 plugin_bridge 最小路径。
+    """
+    box = _run_sync_blocking(days, download_fit, full=full)
+    result = box["result"]
     conn = _conn()
     try:
         conn.execute(
@@ -227,17 +264,55 @@ def sync_garmin(days: int = 30, download_fit: bool = False) -> dict:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (datetime.now().isoformat(timespec="seconds"),))
         conn.commit()
-        hrv_days = conn.execute(
-            "SELECT COUNT(*) c FROM daily_metrics WHERE hrv_last_night IS NOT NULL"
-        ).fetchone()["c"]
-        sleep_days = conn.execute(
-            "SELECT COUNT(*) c FROM daily_metrics WHERE sleep_hours IS NOT NULL"
-        ).fetchone()["c"]
+        from core import store_ext
+        coverage = store_ext.stats(conn)
     finally:
         conn.close()
-    return {"requested_days": days, "daily_days": len(daily),
-            "activities_listed": len(acts), "activities_inserted": inserted,
-            "hrv_days_total": hrv_days, "sleep_days_total": sleep_days}
+    if box.get("full_error"):
+        result["full_error"] = box["full_error"]
+    result["requested_days"] = days
+    result["coverage"] = coverage
+    return result
+
+
+@mcp.tool()
+def get_sleep_detail(date: Optional[str] = None) -> dict:
+    """某一天的睡眠明细：入睡/醒来时刻、各阶段时间线、睡眠评分与评分分项、夜间心率/压力/
+    身体电量/HRV/呼吸的时间序列（可用时）。"""
+    conn = _conn()
+    try:
+        d = (date or datetime.now().date().isoformat())[:10]
+        dm = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (d,)).fetchone()
+        stages = [dict(r) for r in conn.execute(
+            "SELECT seq, stage, start_local, end_local, seconds FROM sleep_stages "
+            "WHERE date=? ORDER BY seq", (d,)).fetchall()]
+        metrics = {r["metric"]: r["value"] for r in conn.execute(
+            "SELECT metric, value FROM garmin_metrics WHERE date=? AND ("
+            "metric LIKE 'sleep%' OR metric LIKE 'avg_sleep%' OR metric LIKE 'avg_overnight%' "
+            "OR metric LIKE 'respiration%' OR metric LIKE 'body_battery_change' "
+            "OR metric LIKE 'restless%' OR metric LIKE 'awake_count' OR metric LIKE 'hrv_%')",
+            (d,)).fetchall()}
+        series = {}
+        for r in conn.execute(
+                "SELECT kind, ts_local, value FROM sleep_series WHERE date=? ORDER BY kind, ts_local",
+                (d,)).fetchall():
+            series.setdefault(r["kind"], []).append([r["ts_local"], r["value"]])
+        return {
+            "date": d,
+            "sleep": None if not dm else {
+                "sleep_hours": dm["sleep_hours"], "deep_h": dm["sleep_deep_h"],
+                "light_h": dm["sleep_light_h"], "rem_h": dm["sleep_rem_h"],
+                "awake_h": dm["sleep_awake_h"], "start": dm["sleep_start"],
+                "end": dm["sleep_end"], "hrv_last_night": dm["hrv_last_night"],
+                "resting_hr": dm["resting_hr"],
+            },
+            "stage_timeline": stages,
+            "metrics": metrics,
+            "series_points": {k: len(v) for k, v in series.items()},
+            "series": series,
+        }
+    finally:
+        conn.close()
 
 
 @mcp.tool()

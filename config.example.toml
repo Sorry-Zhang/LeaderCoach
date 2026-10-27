@@ -33,7 +33,7 @@ channel = "toast"                  # toast | ntfy | both
 ntfy_topic = "REPLACE_WITH_RANDOM_24CHAR"   # 自建 ≥24 字符随机串，topic 即密码
 quiet_hours = ["22:30", "07:00"]
 
-[feeding]
+[logging]
 l1_subjective_days = 2
 l2_subjective_days = 4
 l3_subjective_days = 7
@@ -76,17 +76,29 @@ freeze_threshold = 1.5
 [readiness]
 weights = { hrv = 0.25, tsb = 0.25, sleep = 0.20, rhr = 0.15, subjective = 0.15 }
 
-[gates]
-hrv_dev_gate = -15
-hrv_single_drop_down = -25            # 单日骤降：强度降一档
-hrv_single_drop_easy = -35            # 单日骤降：当日强制轻松
-hrv_gate_persist_days = 2
-luteal_gate_persist_days = 3
-rhr_dev_gate = 10
-rhr_gate_persist_days = 2
-sleep_min_for_quality = 5
-readiness_easy_floor = 40
+[sleep]
+# 个人每晚睡眠需要量（h）：按运动员自身情况在初始化时设定，引擎以它为中心评分。
+# 7.5 只是缺省值；AASM 的 7–9 h 仅作下限参考，不替代个人设定。
+personal_need_h = 7.5
+aasm_floor_h = 7.0
+baseline_days = 28
+# G8 睡眠预测项：observe=只记录不拦截；enforce=真正取消当天质量课
+g8_mode = "observe"
+g8_absolute_floor = 60.0
+g8_use_personal_p10 = true
+g8_p10_window_days = 28
+g8_p10_min_days = 7
 
+[training_forecast]
+hrv_dev_threshold = -15
+hrv_persist_days = 2
+hrv_single_drop_down = -25
+hrv_single_drop_easy = -35
+luteal_persist_days = 3
+rhr_dev_threshold = 10
+rhr_persist_days = 2
+sleep_hours_floor = 5
+readiness_easy_floor = 40
 [cycle]
 enabled = true
 amenorrhea_days = 45

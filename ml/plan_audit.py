@@ -19,6 +19,20 @@ def _flags(conn, day: str) -> dict:
     return {"red_s_active": bool(rs and rs["value"] == "active"),
             "injury_active": bool(inj and inj["c"] > 0)}
 
+def _forecast_items(engine: dict) -> list:
+    """取训练预测项。新字段为空列表时不能退回旧字段（旧字段是 JSON 字符串会误解）。"""
+    v = engine.get("training_forecast")
+    if v is None:
+        v = engine.get("gates_triggered") or []
+        if isinstance(v, str):
+            import json
+            try:
+                v = json.loads(v)
+            except ValueError:
+                v = []
+    return v if isinstance(v, list) else []
+
+
 def build_plan(conn, cfg, day: str, focus: str | None = None) -> dict:
     ed = compute_engine_daily(conn, cfg, day)
     fl = _flags(conn, day)
@@ -32,7 +46,7 @@ def build_plan(conn, cfg, day: str, focus: str | None = None) -> dict:
         "block_week": 0,
         "completion_pct": None,
         "acwr_band": "green" if (acwr is not None and 0.8 <= acwr <= 1.3) else "other",
-        "gate_history": ed.get("gates_triggered") or [],
+        "forecast_history": _forecast_items(ed),
     }
     sport_hist = {r["sport_id"]: r["c"] for r in conn.execute(
         "SELECT sport_id, COUNT(*) c FROM activities GROUP BY sport_id")}
@@ -100,8 +114,8 @@ def audit(plan: dict, diagnosis: dict) -> dict:
                 + (f"历史有但计划未含：{not_planned}。" if not_planned else ""),
     })
 
-    gates = plan["engine"].get("gates_triggered") or []
-    checks.append({"check": "闸门未触发", "value": len(gates), "pass": not gates,
+    gates = _forecast_items(plan["engine"])
+    checks.append({"check": "预测项未命中", "value": len(gates), "pass": not gates,
                    "gates": gates})
 
     failed = [c["check"] for c in checks if not c["pass"]]
@@ -114,7 +128,7 @@ def audit(plan: dict, diagnosis: dict) -> dict:
         "high_intensity_share_pct": hi_share,
         "checks": checks,
         "failed": failed,
-        "verdict": "计划与诊断/闸门一致" if not failed else "存在不一致：" + "；".join(failed),
+        "verdict": "计划与诊断/训练预测一致" if not failed else "存在不一致：" + "；".join(failed),
     }
 
 def main(argv=None):

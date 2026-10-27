@@ -25,6 +25,9 @@ def get_conn(cfg: dict) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    # v1.8 扩展表（只建新表，不改 v1.7 DDL）
+    from . import store_ext
+    store_ext.ensure(conn)
     return conn
 
 def _split_statements(script: str) -> list[str]:

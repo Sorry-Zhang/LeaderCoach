@@ -95,7 +95,7 @@ def run(conn) -> dict:
         "caveat": ("基准 5km 为 submaximal，真实 5k 更快 ⇒ 耐力短板只会更明显"
                    if any(p["label"] == "5km" and p["effort"] == "submaximal"
                           for p in pts) else ""),
-        "note": "描述性诊断，不是训练处方；实际安排需过引擎闸门",
+        "note": "描述性诊断，不是训练安排；实际安排需过引擎训练预测",
     }
 
     return {"anchors": pts, "adjacent_exponents": pairs,

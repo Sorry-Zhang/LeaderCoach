@@ -55,13 +55,33 @@ def cmd_sync(cfg, args):
             print(f"FIT 导入 {imported} 条活动")
         else:
             try:
-                from ingest import plugin_bridge
-                end = datetime.now().date()
-                start = end - timedelta(days=args.days)
-                plugin_bridge.main([
-                    "--start", start.isoformat(), "--end", end.isoformat(),
-                    "--activities", str(args.days), "--insert-activities",
-                ])
+                if getattr(args, "full", True):
+                    # 全量：插件全部只读工具 + 原始存档 + FIT 分段
+                    from ingest import plugin_full
+                    end = datetime.now().date()
+                    start = end - timedelta(days=max(1, args.days) - 1)
+                    rep = plugin_full.run(
+                        start.isoformat(), end.isoformat(), 1,
+                        bool(getattr(args, "download_fit", False)),
+                        plugin_full.DEFAULTS["node"], plugin_full.DEFAULTS["mcp_js"],
+                        plugin_full.DEFAULTS["session"], plugin_full.DEFAULTS["username"],
+                        plugin_full.DEFAULTS["region"], plugin_full.DEFAULTS["account"],
+                        plugin_full.DEFAULTS["fit_dir"])
+                    print(json.dumps({k: rep[k] for k in (
+                        "start", "end", "days", "activities", "inserted", "splits",
+                        "sleep_stage_days", "hrv_reading_days", "stress_series_days",
+                        "battery_series_days", "metric_rows", "raw_written", "raw_bytes")},
+                        ensure_ascii=False, indent=2))
+                    if rep["tools_failed"]:
+                        print(f"未成功的工具调用：{rep['tools_failed'][:5]}")
+                else:
+                    from ingest import plugin_bridge
+                    end = datetime.now().date()
+                    start = end - timedelta(days=args.days)
+                    plugin_bridge.main([
+                        "--start", start.isoformat(), "--end", end.isoformat(),
+                        "--activities", str(args.days), "--insert-activities",
+                    ])
             except Exception as e:
                 print(f"插件同步失败（{e}）。请用 --fit 或 --csv 导入。")
                 sys.exit(1)
@@ -111,7 +131,7 @@ def cmd_today(cfg, args=None):
     print(f"{r['日期']} {r['星期']}  |  诊断 {r['诊断']}  |  模板 {r['模板']}")
     print(f"CTL {st['CTL']}  ATL {st['ATL']}  TSB {st['TSB']}  "
           f"ACWR {st['ACWR']}  Readiness {st['Readiness']}")
-    print(f"闸门 {r['闸门'] or '无'}  |  调整 {r['调整'] or '无'}")
+    print(f"训练预测 {r['训练预测'] or '无'}  |  调整 {r['调整'] or '无'}")
     print("-" * 56)
     for s in r["今日安排"]:
         if "说明" in s and "项目" not in s:
@@ -337,6 +357,11 @@ def main(argv=None):
     sp.add_argument("--csv", help="Garmin 导出 CSV 目录（含 activities.csv）")
     sp.add_argument("--fit", help=".fit 文件目录（Garmin Express）")
     sp.add_argument("--days", type=int, default=60)
+    sp.add_argument("--full", dest="full", action="store_true", default=True,
+                    help="全量采集：插件全部只读工具 + 原始存档 + FIT 分段（默认开启）")
+    sp.add_argument("--legacy", dest="full", action="store_false",
+                    help="旧的最小采集路径（只有日指标 + 活动摘要）")
+    sp.add_argument("--download-fit", action="store_true", help="缺 FIT 时从插件下载")
 
     sub.add_parser("serve", help="启动 MCP stdio 服务")
 
@@ -366,7 +391,7 @@ def main(argv=None):
     hp = sub.add_parser("health", help="导入健康数据 FIT（睡眠/HRV/RHR/压力）")
     hp.add_argument("--fit", required=True, help="健康 FIT 目录（导出健康数据）")
 
-    tp = sub.add_parser("today", help="今日动态处方（按当前状态 + 闸门）")
+    tp = sub.add_parser("today", help="今日训练安排（按当前状态 + 训练预测）")
     tp.add_argument("--date", default=None, help="默认今天")
     tp.set_defaults(func=cmd_today)
 

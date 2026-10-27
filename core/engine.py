@@ -162,15 +162,28 @@ def subjective_score(soreness, sleep_feel) -> float | None:
     score = 60 + (5 - soreness) * 8 + (sleep_feel - 3) * 5
     return max(0.0, min(100.0, score))
 
-def compute_readiness(hrv_dev, tsb, sleep_hours, rhr_dev, soreness, sleep_feel, weights) -> dict:
+def compute_readiness(hrv_dev, tsb, sleep_hours, rhr_dev, soreness, sleep_feel, weights,
+                      sleep_score=None) -> dict:
+    """五支柱加权。sleep_score 非空时用它替代「睡了几小时」的绝对插值。"""
     pillars = {}
     raw = {
-        "hrv": hrv_dev, "tsb": tsb, "sleep": sleep_hours, "rhr": rhr_dev,
+        "hrv": hrv_dev, "tsb": tsb, "rhr": rhr_dev,
     }
     for kind, val in raw.items():
         sc = pillar_score(kind, val)
         if sc is not None:
             pillars[kind] = {"value": val, "weight": weights[kind], "score": round(sc)}
+
+    if sleep_score is not None:
+        pillars["sleep"] = {"value": sleep_hours, "weight": weights["sleep"],
+                            "score": round(_clamp(sleep_score, 0, 100)),
+                            "source": "sleep_state"}
+    elif sleep_hours is not None:
+        sc = pillar_score("sleep", sleep_hours)
+        if sc is not None:
+            pillars["sleep"] = {"value": sleep_hours, "weight": weights["sleep"],
+                                "score": round(sc), "source": "hours_abs"}
+
     sub = subjective_score(soreness, sleep_feel)
     if sub is not None:
         pillars["subjective"] = {"value": None, "weight": weights["subjective"], "score": round(sub)}
@@ -184,24 +197,35 @@ def compute_readiness(hrv_dev, tsb, sleep_hours, rhr_dev, soreness, sleep_feel, 
     confidence = "high" if n >= 5 else ("medium" if n >= 3 else "low")
     return {"score": round(score, 1), "confidence": confidence, "pillars": pillars}
 
-def evaluate_gates(ctx: dict, cfg: dict) -> list[dict]:
-    f, g = cfg["fitness"], cfg["gates"]
-    gates = []
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def evaluate_training_forecast(ctx: dict, cfg: dict) -> list[dict]:
+    """当天训练预测：命中哪些情况、各自建议怎么调整。
+
+    返回值仍用稳定的编号（G1…G10，历史沿用），`gate` 字段保留作兼容键名，
+    对用户展示时称「预测项」。
+    """
+    f = cfg["fitness"]
+    g = cfg["training_forecast"]
+    items = []
 
     tsb = ctx.get("tsb")
     if tsb is not None and tsb <= f["tsb_hard_gate"]:
-        gates.append({"gate": "G2", "action": "休息日（TSB ≤ 硬闸）"})
+        items.append({"gate": "G2", "action": "休息日（TSB 低于硬下限）"})
     elif tsb is not None and tsb <= f["tsb_soft_gate"]:
-        gates.append({"gate": "G1", "action": "当日强制轻松课（TSB ≤ 软闸）"})
+        items.append({"gate": "G1", "action": "当日安排轻松课（TSB 低于预警线）"})
 
     acwr = ctx.get("acwr")
     if acwr is not None and acwr > cfg["acwr"]["freeze_threshold"]:
-        gates.append({"gate": "G3", "action": "质量课冻结（当日+次日）"})
+        items.append({"gate": "G3", "action": "质量课冻结（当日+次日）"})
 
     hrv_hist = ctx.get("hrv_dev_history") or []
-    persist = g["luteal_gate_persist_days"] if ctx.get("luteal_phase_confound") else g["hrv_gate_persist_days"]
-    if len(hrv_hist) >= persist and all(v is not None and v <= g["hrv_dev_gate"] for v in hrv_hist[-persist:]):
-        gates.append({"gate": "G4", "action": "强度降级一档（HRV 连续偏离）",
+    persist = g["luteal_persist_days"] if ctx.get("luteal_phase_confound") else g["hrv_persist_days"]
+    if len(hrv_hist) >= persist and all(v is not None and v <= g["hrv_dev_threshold"] for v in hrv_hist[-persist:]):
+        items.append({"gate": "G4", "action": "强度降级一档（HRV 连续偏离）",
                       "options": ["降级一档", "维持原计划", "改为轻松课"]})
 
     # 单日骤降：熬夜、疾病、急性压力等非训练因素也会造成大幅下跌，
@@ -212,41 +236,53 @@ def evaluate_gates(ctx: dict, cfg: dict) -> list[dict]:
     options = ["改为轻松课", "维持原计划", "视体感再定"]
     if hrv_today is not None:
         if hrv_today <= g["hrv_single_drop_easy"]:
-            gates.append({"gate": "G4c",
+            items.append({"gate": "G4c",
                           "action": f"建议当日轻松课（HRV 单日骤降 {hrv_today:.1f}%）",
                           "options": options,
                           "user_choice_required": True})
         elif hrv_today <= g["hrv_single_drop_down"]:
-            gates.append({"gate": "G4b",
+            items.append({"gate": "G4b",
                           "action": f"建议强度降级一档（HRV 单日骤降 {hrv_today:.1f}%）",
                           "options": options,
                           "user_choice_required": True})
 
     rhr_hist = ctx.get("rhr_dev_history") or []
     fever = ctx.get("fever", False)
-    if fever or (len(rhr_hist) >= g["rhr_gate_persist_days"]
-                 and all(v is not None and v >= g["rhr_dev_gate"] for v in rhr_hist[-g["rhr_gate_persist_days"]:])):
-        gates.append({"gate": "G5", "action": "疾病协议（休息 + 疾病旗）"})
+    if fever or (len(rhr_hist) >= g["rhr_persist_days"]
+                 and all(v is not None and v >= g["rhr_dev_threshold"] for v in rhr_hist[-g["rhr_persist_days"]:])):
+        items.append({"gate": "G5", "action": "疾病方案（休息 + 标记疾病）"})
 
     if ctx.get("injury_active"):
-        gates.append({"gate": "G6", "action": "禁跑分支 + 按伤位限制（constraint_json）"})
+        items.append({"gate": "G6", "action": "禁跑分支 + 按伤位限制（constraint_json）"})
 
     readiness = ctx.get("readiness")
     if readiness is not None and readiness < g["readiness_easy_floor"]:
-        gates.append({"gate": "G7", "action": "默认轻松日"})
+        items.append({"gate": "G7", "action": "默认轻松日"})
 
+    # 睡眠：默认只观察不拦截（sleep.g8_mode=observe）。
+    # 触发条件由 core.sleep_health.g8_status 判定：分数 < min(个人 p10, 绝对下限)。
+    sleep_state = ctx.get("sleep_state_score")
     sleep_h = ctx.get("sleep_hours")
-    if sleep_h is not None and sleep_h < g["sleep_min_for_quality"]:
-        gates.append({"gate": "G8", "action": "当日无质量课"})
+    g8_mode = str(ctx.get("sleep_g8_mode", "observe")).lower()
+    if g8_mode == "enforce":
+        if ctx.get("sleep_g8_enforced"):
+            items.append({"gate": "G8",
+                          "action": f"当日不排质量课（睡眠状态分 {sleep_state:.0f}，低于个人阈值）"})
+        elif sleep_state is None and sleep_h is not None and sleep_h < g["sleep_hours_floor"]:
+            items.append({"gate": "G8", "action": "当日不排质量课"})
 
     if ctx.get("red_s_active"):
-        gates.append({"gate": "G9", "action": "负荷 −20~30% + 暂停减脂 + 蛋白质 1.8–2.2 g/kg"})
+        items.append({"gate": "G9", "action": "负荷 −20~30% + 暂停减脂 + 蛋白质 1.8–2.2 g/kg"})
 
     cramps = ctx.get("cramps_today")
     if cramps is not None and cramps >= 7:
-        gates.append({"gate": "G10", "action": "当日强制轻松课（痛经 ≥7/10）"})
+        items.append({"gate": "G10", "action": "当日安排轻松课（痛经 ≥7/10）"})
 
-    return gates
+    return items
+
+
+# 兼容旧调用名；新代码请用 evaluate_training_forecast
+evaluate_gates = evaluate_training_forecast
 
 def evaluate_reds(ctx: dict, cfg: dict) -> dict:
     r = cfg["reds"]
@@ -256,7 +292,7 @@ def evaluate_reds(ctx: dict, cfg: dict) -> dict:
         triggers.append("T1")
     hrv_hist = ctx.get("hrv_dev_history") or []
     if len(hrv_hist) >= r["hrv_dev_persist_days"] and all(
-        v is not None and v <= cfg["gates"]["hrv_dev_gate"] for v in hrv_hist[-r["hrv_dev_persist_days"]:]
+        v is not None and v <= cfg["training_forecast"]["hrv_dev_threshold"] for v in hrv_hist[-r["hrv_dev_persist_days"]:]
     ):
         triggers.append("T2")
     rhr_hist = ctx.get("rhr_dev_history") or []
@@ -389,11 +425,11 @@ def validate_week_plan(week: dict, ctx: dict, cfg: dict) -> list[dict]:
             results.append({"rule": "R4", "level": "REJECT", "evidence": str(c["pair"]),
                             "message": c["message"]})
 
-    gates_active = ctx.get("gates_active") or []
-    if gates_active and quality_count > 0:
+    forecast_hits = ctx.get("forecast_hits") or []
+    if forecast_hits and quality_count > 0:
         results.append({"rule": "R5", "level": "REJECT",
-                        "evidence": f"闸门 {gates_active} 激活期间有 {quality_count} 节质量课",
-                        "message": "闸门激活期间禁止质量课"})
+                        "evidence": f"预测项 {forecast_hits} 命中期间有 {quality_count} 节质量课",
+                        "message": "预测项命中期间不排质量课"})
 
     if total_au > 0 and long_au > 0.30 * total_au:
         results.append({"rule": "R6", "level": "WARN",
@@ -434,10 +470,10 @@ def validate_week_plan(week: dict, ctx: dict, cfg: dict) -> list[dict]:
                         "evidence": "第 4 周未减量 −30~40%",
                         "message": "4 周循环第 4 周应减量"})
 
-    if gates_active and not ctx.get("gate_load_reduced"):
+    if forecast_hits and not ctx.get("forecast_load_reduced"):
         results.append({"rule": "R12", "level": "WARN",
-                        "evidence": "闸门激活期间周总量未按动作包降级",
-                        "message": "闸门激活期间应下调周总量"})
+                        "evidence": "预测项命中期间周总量未按建议下调",
+                        "message": "预测项命中期间应下调周总量"})
 
     inj = ctx.get("injury_constraints") or {}
     forbid = inj.get("forbid") or []

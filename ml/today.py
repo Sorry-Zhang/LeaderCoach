@@ -16,12 +16,26 @@ REST_GATES = {"G2", "G5"}
 EASY_GATES = {"G1", "G3", "G7", "G8", "G10"}
 DOWN_GATES = {"G4", "G9"}
 
+def _forecast_items(engine: dict) -> list:
+    """取训练预测项。新字段为空列表时不能退回旧字段（旧字段是 JSON 字符串会误解）。"""
+    v = engine.get("training_forecast")
+    if v is None:
+        v = engine.get("gates_triggered") or []
+        if isinstance(v, str):
+            import json
+            try:
+                v = json.loads(v)
+            except ValueError:
+                v = []
+    return v if isinstance(v, list) else []
+
+
 def apply_gates(sessions: list[dict], gates: list[dict]) -> tuple[list[dict], list[str]]:
     ids = {g["gate"] for g in gates}
     actions = []
     out = []
     if ids & REST_GATES:
-        actions.append("触发休息闸门 → 今日休息")
+        actions.append("触发休息预测 → 今日休息")
         return [], actions
 
     for s in sessions:
@@ -29,7 +43,7 @@ def apply_gates(sessions: list[dict], gates: list[dict]) -> tuple[list[dict], li
         if ids & EASY_GATES and (s.get("planned_rpe") or 0) >= 6:
             s["planned_rpe"] = 3
             s["structure"] = None
-            s["notes"] = (s.get("notes") or "") + " 闸门降级：质量课→轻松"
+            s["notes"] = (s.get("notes") or "") + " 预测降级：质量课→轻松"
             actions.append(f"{s.get('sport_id')} 质量课→轻松")
         elif ids & DOWN_GATES and (s.get("planned_rpe") or 0) >= 7:
             s["planned_rpe"] = max(3, (s.get("planned_rpe") or 7) - 1)
@@ -54,7 +68,7 @@ def today(conn, cfg, day: str) -> dict:
     plan = build_plan(conn, cfg, day, focus=focus)
     wd = date.fromisoformat(day).strftime("%a").lower()[:3]
     sessions = list(plan["week"]["days"].get(wd, {}).get("sessions") or [])
-    gates = plan["engine"].get("gates_triggered") or []
+    gates = _forecast_items(plan["engine"])
     adjusted, actions = apply_gates(sessions, gates)
 
     ed = plan["engine"]
@@ -67,7 +81,7 @@ def today(conn, cfg, day: str) -> dict:
         },
         "诊断": focus,
         "模板": plan["selection"].get("template_id"),
-        "闸门": [g.get("gate") for g in gates],
+        "训练预测": [g.get("gate") for g in gates],
         "调整": actions,
         "今日安排": [_fmt_session(s) for s in adjusted] or [{"说明": "休息日"}],
         "周预算_AU": plan["week"].get("week_budget_au"),
