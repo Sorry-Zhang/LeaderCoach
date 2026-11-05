@@ -123,11 +123,15 @@ def parse_fit(path) -> dict:
 # ── 运动分段：lap（手动/自动圈）与 1 km 自动分段 → activity_splits ─────────
 
 def extract_splits(path) -> dict:
-    """解析一个活动 FIT 的分段信息。
+    """解析一个活动 FIT 的分段信息（含爬升与坡度调整配速）。
 
     返回 {"start_time": "YYYY-MM-DD HH:MM:SS",
-          "laps": [{idx, distance_m, timer_s, avg_hr, max_hr, ascent_m, start_time}],
-          "km_splits": [{km, pace_min_km, avg_hr, elevation_gain_m}]}
+          "laps": [{idx, distance_m, timer_s, avg_hr, max_hr, ascent_m, start_time, ...爬坡字段}],
+          "km_splits": [{km, pace_min_km, avg_hr, max_hr, distance_m, duration_s,
+                         start_time, end_time,
+                         elevation_gain_m, elevation_loss_m, net_elevation_m,
+                         avg_grade_pct, max_grade_pct, gap_pace_min_km}]}
+    爬升/坡度由 record 层的 enhanced_altitude 逐点算出（见 core.grade）。
     """
     try:
         import fitdecode
@@ -169,59 +173,58 @@ def extract_splits(path) -> dict:
             "start_time": ls,
         })
 
-    # 1 km 自动分段：按累计距离切分 record
-    km_rows = []
-    km = 1
-    seg_start_t = seg_start_hr_sum = None
-    hr_vals, seg_count = [], 0
-    seg_start_d = None
+    # ── 逐点序列（距离 + 海拔 + 心率）。海拔优先用 enhanced_altitude ──
+    pts = []
     for r in sorted(records, key=lambda x: (x.get("timestamp") is None, x.get("timestamp"))):
         d = r.get("distance")
         t = r.get("timestamp")
-        hr = r.get("heart_rate")
         if d is None or t is None:
             continue
-        if seg_start_d is None:
-            seg_start_d, seg_start_t = d, t
-        if hr is not None:
-            hr_vals.append(hr)
-        if d - seg_start_d >= 1000:
-            secs = (t - seg_start_t).total_seconds()
+        alt = r.get("enhanced_altitude")
+        if alt is None:
+            alt = r.get("altitude")
+        pts.append({"d": d, "t": t, "alt": alt, "hr": r.get("heart_rate")})
+
+    km_rows = []
+    if len(pts) >= 2:
+        from core import grade as grademod
+        km = 1
+        seg = 0                      # 当前分段在 pts 里的起始下标
+        for i in range(1, len(pts)):
+            span = pts[i]["d"] - pts[seg]["d"]
+            is_last = i == len(pts) - 1
+            if span < 1000 and not is_last:
+                continue
+            chunk = pts[seg:i + 1]
+            dspan = chunk[-1]["d"] - chunk[0]["d"]
+            secs = (chunk[-1]["t"] - chunk[0]["t"]).total_seconds()
+            # 末段不足 100 m 视为零头，丢弃
+            if is_last and span < 1000 and dspan < 100:
+                break
+            hrs = [p["hr"] for p in chunk if p["hr"] is not None]
+            elev = grademod.segment_stats([(q["d"], q["alt"]) for q in chunk])
+            pace = round(secs / 60 / (dspan / 1000), 3) if secs > 0 and dspan > 0 else None
             km_rows.append({
                 "km": km,
-                "pace_min_km": round(secs / 60, 3) if secs > 0 else None,
-                "avg_hr": round(sum(hr_vals) / len(hr_vals)) if hr_vals else None,
-                "max_hr": max(hr_vals) if hr_vals else None,
-                "elevation_gain_m": None,
-                "distance_m": round(d - seg_start_d, 1),
+                "pace_min_km": pace,
+                "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
+                "max_hr": max(hrs) if hrs else None,
+                "distance_m": round(dspan, 1),
                 "duration_s": round(secs, 1) if secs > 0 else None,
-                "start_time": _local_str(seg_start_t),
-                "end_time": _local_str(t),
+                "start_time": _local_str(chunk[0]["t"]),
+                "end_time": _local_str(chunk[-1]["t"]),
+                "elevation_gain_m": elev["gain_m"],
+                "elevation_loss_m": elev["loss_m"],
+                "net_elevation_m": elev["net_m"],
+                "avg_grade_pct": elev["avg_grade_pct"],
+                "max_grade_pct": elev["max_grade_pct"],
+                "gap_pace_min_km": grademod.grade_adjusted_pace(pace, elev["cost_ratio"]),
             })
             km += 1
-            seg_start_d, seg_start_t, hr_vals = d, t, []
-    # 收尾：最后不足 1 km 的余量（>100 m 才算一段）
-    if seg_start_t is not None and seg_start_d is not None:
-        try:
-            last = sorted((r for r in records if r.get("distance") is not None
-                           and r.get("timestamp") is not None),
-                          key=lambda x: x["timestamp"])[-1]
-            tail_d = last["distance"] - seg_start_d
-            tail_s = (last["timestamp"] - seg_start_t).total_seconds()
-            if tail_d and tail_d > 100 and tail_s and tail_s > 0:
-                km_rows.append({
-                    "km": km,
-                    "pace_min_km": round((tail_s / 60) / (tail_d / 1000), 3),
-                    "avg_hr": round(sum(hr_vals) / len(hr_vals)) if hr_vals else None,
-                    "max_hr": max(hr_vals) if hr_vals else None,
-                    "elevation_gain_m": None,
-                    "distance_m": round(tail_d, 1),
-                    "duration_s": round(tail_s, 1),
-                    "start_time": _local_str(seg_start_t),
-                    "end_time": _local_str(last["timestamp"]),
-                })
-        except Exception:  # noqa: BLE001
-            pass
+            if is_last:
+                break
+            seg = i                    # 边界点作为下一段的起点
+
     return {"start_time": st, "laps": lap_rows, "km_splits": km_rows}
 
 
@@ -345,18 +348,24 @@ def rebuild_splits(cfg, files, conn=None, infos: dict | None = None) -> int:
                             laps_end = None
                     lap_rows.append((act["id"], "lap", l["idx"] + 1, dist, secs, pace,
                                      l["avg_hr"], l.get("max_hr"), l["ascent_m"],
-                                     laps_st, laps_end, "fit"))
+                                     laps_st, laps_end, "fit",
+                                     None, None, None, None, None))
             for k in info["km_splits"]:
                 km_rows.append((act["id"], "km", k["km"], k.get("distance_m"), k.get("duration_s"),
                                 k["pace_min_km"], k["avg_hr"], k.get("max_hr"),
                                 k.get("elevation_gain_m"), k.get("start_time"),
-                                k.get("end_time"), "fit"))
+                                k.get("end_time"), "fit",
+                                k.get("elevation_loss_m"), k.get("net_elevation_m"),
+                                k.get("avg_grade_pct"), k.get("max_grade_pct"),
+                                k.get("gap_pace_min_km")))
             detail_rows = km_rows + lap_rows
             if detail_rows:
                 conn.executemany(
                     "INSERT OR REPLACE INTO activity_split_detail(activity_id, split_type, seq, "
                     "distance_m, duration_s, pace_min_km, avg_hr, max_hr, elevation_gain_m, "
-                    "start_time, end_time, source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", detail_rows)
+                    "start_time, end_time, source, elevation_loss_m, net_elevation_m, "
+                    "avg_grade_pct, max_grade_pct, gap_pace_min_km) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", detail_rows)
             # 旧表 activity_splits 保留一份兼容副本：有圈存圈，否则存公里
             legacy = []
             if lap_rows:

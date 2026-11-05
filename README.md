@@ -57,7 +57,7 @@
 | 压力 / 身体电量 | `get_garmin_stress` / `_summaries` / `get_garmin_body_battery` | `stress_series`、`body_battery_series`、`daily_metrics.stress_daily_avg` |
 | 训练 | `get_garmin_training_readiness` / `daily_training_status` / `training_status` / `training_load_balance` / `max_metrics(_range)` / `race_predictions(_range)` | `garmin_metrics` + `official_snapshot` |
 | 其它 | 心率、步数、体重、训练库、个人资料 | `garmin_metrics` / 原始存档 |
-| 运动分段 | 本地 FIT 的每公里分段 + 设备圈分段（**两套并存**） | `activity_split_detail`（每段距离/用时/配速/均心率/最高心率/爬升/起止时刻）+ 兼容副本 `activity_splits`；明细另存 `activities.annotation` |
+| 运动分段 | 本地 FIT 的每公里分段 + 设备圈分段（**两套并存**） | `activity_split_detail`（每段距离/用时/配速/均心率/最高心率/爬升/下降/净爬升/平均坡度/最大坡度/**GAP**/起止时刻）+ 兼容副本 `activity_splits` |
 
 - 原始存档按 `tool/日期.json.gz` 保存（同名时更新为本轮返回）；解析器有变更时可
   `python -m ingest.plugin_full --replay` 用同一份存档重新解析回填。
@@ -68,6 +68,41 @@
 - 旧的最小采集路径仍可用：`python main.py sync --legacy` 或 `sync_garmin(full=False)`。
 - Garmin 官方指标是**隔离层**，只作参考，不参与自算准备度；`config.toml` 的
   `[garmin_plugin]` 可调 `raw_dir` / `full_sync` / `replay_raw_each_sync`。
+
+### 坡度-配速分析（v1.12）
+
+`core/grade.py` 从 FIT 的 `enhanced_altitude` 逐点还原每公里爬升与坡度，并据此给出
+**坡度调整配速（GAP）**，用于在起伏路线上公平比较「同样用力跑得快不快」。
+
+**爬升统计**用阈值累计法（迟滞），避免气压/GPS 噪声把总爬升放大数倍：
+
+- 相邻海拔变化累计超过 `[grade] min_climb_m`（默认 1.5 m）才计入爬升，否则丢弃；
+- 实测该阈值下总爬升约为 Garmin 官方 `total_ascent` 的 **0.9 倍**，且各次活动一致
+  （比值稳定比绝对值更重要——趋势分析只依赖一致性）；
+- 调到 3–5 m 会更保守，只统计明显爬坡。
+
+**GAP** 用 Minetti et al. (2002) 跑步代谢代价方程：
+
+```
+Cr(i) = 155.4·i⁵ − 30.4·i⁴ − 43.3·i³ + 46.3·i² + 19.5·i + 3.6     [J·kg⁻¹·m⁻¹]
+GAP   = 实际配速 × (距离加权平均 Cr / Cr(0))            Cr(0) = 3.6
+```
+
+坡度按 `[grade] window_m`（默认 50 m）滑动窗口计算——FIT 海拔分辨率 0.1 m、采样约 4 m，
+逐点算坡度会得到 1 m/20 m = 5% 的假陡坡。
+
+**坡度-配速响应**（`sec_per_1pct_grade`）：对一次跑的各段做「平均坡度 → 配速」线性回归，
+斜率即每 +1% 坡度配速慢多少秒/km（典型 8–15 s，越小＝爬坡能力越强）。
+同时给出 `r2` 与 `grade_span_pct`：
+
+- `r2 < 0.15` 或 `grade_span_pct < 1.5%` → 本次配速变化主要不是坡度造成的（间歇、后程加速等），
+  **不要**用它评价爬坡能力；
+- 趋势工具只用 `r2 ≥ 0.30 且 span ≥ 1.5% 且斜率在 −5~60 s` 的样本，避免噪声拟合出现 ±400 s/% 的假值。
+
+MCP 工具：
+- `get_activity_detail(activity_id, granularity="km")` — 每段带 爬升/下降/净爬升/平均坡度/最大坡度/GAP；
+- `get_grade_analysis(activity_id)` — 单次活动的逐段坡度明细 + 坡度-配速响应；
+- `get_grade_analysis()` — 近 N 天按周的爬坡能力趋势（爬升密度、实际 vs GAP、坡度响应）。
 
 ### 数据可用性随设备设置变化（以本账号实测为准）
 
@@ -198,6 +233,21 @@ tests/      引擎与 schema 测试
 
 ## 更新
 
+- 2026-11-05（v1.12）：**补齐全部分段 + 坡度-配速体系 + 数据去重**。
+  * 分段覆盖率 42 → 568/569 个活动（99.8%），只剩 1 条室内攀岩（无距离无 FIT，本就没有分段）。
+  * 新增 `core/grade.py`：阈值累计法统计爬升、Minetti 方程算 GAP、滑动窗口坡度、
+    坡度-配速响应回归；`activity_split_detail` 追加
+    `elevation_loss_m / net_elevation_m / avg_grade_pct / max_grade_pct / gap_pace_min_km`。
+  * 新增 MCP 工具 `get_grade_analysis(activity_id=None, range_days=90)`：
+    单次坡度明细或跨周爬坡能力趋势；`get_activity_detail` 的分段也带上坡度与 GAP。
+  * **修复数据重复**：40 条 CSV 导入活动里 39 条与 Garmin 插件采集指向同一次运动
+    （距离差最大 5 m）。`scripts/dedup_activities.py` 先把 CSV 侧的
+    `hr_trimp / load_final / load_path_used` 迁移到插件记录（插件侧原本为 NULL，
+    直接删会丢掉这些天的负荷），再删除 CSV 记录并重算受影响日期的引擎输出。
+    活动数 608 → 569，负荷合计不变（说明负荷原本没被重复计算，只是记录重复）。
+  * 新增 `scripts/fetch_fit.py`（按 activityId 或最近 N 天补下 FIT）、
+    `scripts/dedup_activities.py`；`tests/test_grade.py` 14 项（Minetti 曲线、
+    阈值法抗噪、GAP 单调性、回归斜率）。
 - 2026-11-05（v1.11）：**修复运动分段长期缺失**。三处根因与改动：
   1. `core/store.py` 曾把 `start_time` 截成日期，导致 FIT 分段无法按开始时刻对齐活动
      → 改为保留完整时间戳，并同步修正 `core/daily.py`、`mcp_server/tools.py` 里按日期

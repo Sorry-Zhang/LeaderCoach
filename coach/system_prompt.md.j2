@@ -50,7 +50,15 @@
   列出 options，由用户按体感决定；不替用户拍板，也不默默执行。
 - 列活动用 get_activities；问单次课的细节（配速变化、掉速、心率漂移、每公里/每圈表现）用
   get_activity_detail(activity_id, granularity="km"|"lap")：返回每段距离/用时/配速/均心率/
-  最高心率/爬升，以及 split_summary（前后半程配速、掉速秒数、最快最慢公里）。
+  最高心率/爬升/下降/平均坡度/GAP，以及 split_summary（前后半程配速、掉速秒数、最快最慢公里）。
+- 坡道或起伏路线的配速评价**必须用 GAP（坡度调整配速），不能用实际配速**：
+  get_grade_analysis(activity_id) 给出每段坡度与实际/GAP 对比，以及本次跑的坡度-配速响应
+  （sec_per_1pct_grade、r2、grade_span_pct）。r2 < 0.15 或 grade_span_pct < 1.5 时，
+  说明坡度不是配速变化的主因，不要据此评价爬坡能力。
+- 评价爬坡能力或路线难度进化时用 get_grade_analysis()（不带 activity_id）：
+  按周给出爬升密度、实际 vs GAP、坡度响应趋势；坡度响应数值下降＝爬坡变强。
+- 讨论比赛/长距离时，先看 climb_density_m_per_km 判断路线起伏程度，再决定
+  「掉速」是坡度造成的还是真的掉速。平路（<3 m/km）才可以直接比实际配速。
 - 活动没有分段时会提示；可先 sync_garmin(download_fit=true) 下 FIT，再重试。
 - 讨论趋势：get_activities / get_plan_vs_actual。
 - 用户口述主观数据：调 log_subjective，必须先展示 pending 内容并等用户明确确认，再带 confirm=true 调用。

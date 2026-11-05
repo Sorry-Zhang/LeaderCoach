@@ -67,7 +67,17 @@ def ensure(conn) -> None:
     for stmt in DDL:
         conn.execute(stmt)
     _migrate_split_columns(conn)
+    _migrate_grade_columns(conn)
     conn.commit()
+
+
+def _migrate_grade_columns(conn) -> None:
+    """activity_split_detail 的爬升/坡度/GAP 列由 core.grade 统一管理。"""
+    try:
+        from . import grade
+        grade.ensure_columns(conn)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # activity_splits 在 v1.7 里只存 km/pace/avg_hr/elev。分段读取工具需要每段的
