@@ -283,33 +283,12 @@ tests/      引擎与 schema 测试
 
 ## 更新
 
-- 2026-11-05（v1.12）：**补齐全部分段 + 坡度-配速体系 + 数据去重**。
-  * 分段覆盖率 42 → 568/569 个活动（99.8%），只剩 1 条室内攀岩（无距离无 FIT，本就没有分段）。
-  * 新增 `core/grade.py`：阈值累计法统计爬升、Minetti 方程算 GAP、滑动窗口坡度、
-    坡度-配速响应回归；`activity_split_detail` 追加
-    `elevation_loss_m / net_elevation_m / avg_grade_pct / max_grade_pct / gap_pace_min_km`。
-  * 新增 MCP 工具 `get_grade_analysis(activity_id=None, range_days=90)`：
-    单次坡度明细或跨周爬坡能力趋势；`get_activity_detail` 的分段也带上坡度与 GAP。
-  * **修复数据重复**：40 条 CSV 导入活动里 39 条与 Garmin 插件采集指向同一次运动
-    （距离差最大 5 m）。`scripts/dedup_activities.py` 先把 CSV 侧的
-    `hr_trimp / load_final / load_path_used` 迁移到插件记录（插件侧原本为 NULL，
-    直接删会丢掉这些天的负荷），再删除 CSV 记录并重算受影响日期的引擎输出。
-    活动数 608 → 569，负荷合计不变（说明负荷原本没被重复计算，只是记录重复）。
-  * 新增 `scripts/fetch_fit.py`（按 activityId 或最近 N 天补下 FIT）、
-    `scripts/dedup_activities.py`；`tests/test_grade.py` 14 项（Minetti 曲线、
-    阈值法抗噪、GAP 单调性、回归斜率）。
-- 2026-11-05（v1.11）：**修复运动分段长期缺失**。三处根因与改动：
-  1. `core/store.py` 曾把 `start_time` 截成日期，导致 FIT 分段无法按开始时刻对齐活动
-     → 改为保留完整时间戳，并同步修正 `core/daily.py`、`mcp_server/tools.py` 里按日期
-     字符串比较的地方（改为 `substr(start_time,1,10)`）。
-  2. `ingest/fit_parser.py` 的 `rebuild_splits` 改为优先用 **FIT 文件名 = activityId**
-     匹配活动，回退到「时刻 ±90 min + 时长」打分匹配，并把 FIT 路径回写 `activities.fit_path`。
-  3. 新增 `activity_split_detail` 表，**每公里与设备圈两套粒度并存**（旧表主键无法共存）。
-  另新增 MCP 工具 `get_activity_detail(activity_id, granularity="km|lap|auto")`，
-  返回每段距离/用时/配速/均心率/最高心率/爬升 + 前后半程配速对比；
-  `sync_garmin` 改为**默认异步 job**（返回 `job_id`，用 `get_sync_status` 轮询），
-  长同步不再阻塞对话。新增 `scripts/backfill_splits.py`、`scripts/fetch_fit.py`。
-  本次回填：分段 232 → 4,900+ 条，覆盖活动 42 → 537 个（88%）。
+- 2026-11-05（v1.12）：新增 `core/grade.py` 坡度-配速分析（Minetti GAP、分段地形分类、
+  跨活动池化的上坡惩罚/下坡收益）；新增 MCP 工具 `get_grade_analysis`；分段覆盖补齐至
+  568/569 个活动；合并 39 组 CSV/插件重复活动（负荷字段迁移后删记录）。
+- 2026-11-05（v1.11）：修复运动分段长期缺失——`start_time` 被截成日期导致 FIT 无法对齐活动；
+  新增 `activity_split_detail` 表（每公里/设备圈两套并存）与 `get_activity_detail`；
+  `sync_garmin` 改为异步 job，长同步不再阻塞对话。
 - 2026-10-27（v1.10）：G8 改为观察模式——触发条件 `睡眠状态分 < min(个人 28 天 p10, 60)`，
   只写入 `garmin_metrics` 与简报、不改变训练；`sleep.g8_mode="enforce"` 才真正拦截。
 - 2026-10-27（v1.9）：新增睡眠状态评分 `core/sleep_health.py`（六维、个人需要量 7.5 h 可配）；
