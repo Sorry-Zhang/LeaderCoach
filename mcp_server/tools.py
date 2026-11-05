@@ -597,20 +597,35 @@ def get_activity_detail(activity_id: str, granularity: str = "auto",
 @mcp.tool()
 def get_grade_analysis(activity_id: Optional[str] = None, range_days: int = 90,
                        min_distance_km: float = 3.0) -> dict:
-    """坡度-配速分析：爬坡能力与坡度调整配速（GAP）。
+    """坡度-配速分析：分段地形构成、上坡惩罚/下坡收益、坡度调整配速（GAP）。
 
-    两种用法：
-      1) 给 activity_id → 单次活动的逐段坡度明细（每公里爬升/下降/平均坡度/最大坡度/
-         实际配速/GAP）+ 该次跑的坡度-配速响应斜率。
-      2) 不给 → 近 range_days 天的**爬坡能力趋势**：每周的爬升密度、
-         GAP 与实际配速差、坡度-配速响应斜率随时间的变化。
+    **重要方法论**：整次活动的爬升密度不能用来判断分段坡度影响。同样的平均值
+    既可以来自缓坡连绵，也可以来自陡上陡下交替——实测你的数据里，活动平均的
+    实际-GAP 差只有 0.2–2 秒，但单个分段的修正量可达 47–55 秒（相差近百倍）。
+    要看分段级差异，必须用 terrain_breakdown / segment_deviation /
+    max_segment_gap_delta_sec。
 
-    核心概念：
-      - GAP（坡度调整配速）= 实际配速 × 坡度代谢代价比。把坡的影响扣掉后比较，
-        才能公平判断「同样用力跑得快不快」（Minetti 2002 代谢代价方程）。
-      - sec_per_1pct_grade：每 +1% 坡度配速变化多少秒/km。越小=爬坡能力越强。
-        r2 低说明该次跑配速波动主要不是坡度造成的（例如间歇、比赛后程加速）。
-      - climb_density_m_per_km：每公里平均爬升，衡量路线起伏程度。
+    用法一：给 activity_id → 单次活动
+      - splits：每段带 terrain 标签（climb/descent/mixed/rolling/flat）、
+        段内起伏 roughness_m、平均/最大坡度、实际配速、GAP
+      - terrain_breakdown：按地形分组统计（段数/距离/爬升/实际配速/GAP）
+      - segment_deviation：用 GAP 归一化找「相对最费力 / 最轻松」的段
+        （GAP 已扣掉坡度，所以这里的偏离是真实用力或疲劳，不是地形）
+      - asymmetry：上坡惩罚 vs 下坡收益（单次样本常不足，会明确标注）
+      - summary.max_segment_gap_delta_sec：本次分段级坡度修正的最大值
+
+    用法二：不给 activity_id → 跨活动统计
+      - overall：全周期池化回归的上坡惩罚/下坡收益（样本量大才可信）
+      - period_compare：近 N 周 vs 之前 N 周的对比（含可信度标注）
+      - weeks：按周的分段级地形构成（含每周最大段内 GAP 修正）
+
+    关键概念：
+      - GAP = 实际配速 ÷ 坡度代价比（Minetti 2002）。上坡段 GAP 比实际配速**快**，
+        下坡段更慢。判断「这段是否掉速」要看 GAP 不看实际配速。
+      - uphill_penalty_sec_per_1pct：每 +1% 坡度慢多少秒/km（典型 10–20）。
+      - asymmetry_ratio = 下坡收益/上坡惩罚（典型 0.4–0.8，下坡收不回上坡损失）。
+      - 合并成一条直线的 r2 天然很低（0.01 级），因为上下坡效应互相抵消——
+        这不代表坡度没影响，要看分开的斜率。
     """
     from core import grade as grademod
     conn = _conn()
@@ -635,83 +650,20 @@ def get_grade_analysis(activity_id: Optional[str] = None, range_days: int = 90,
                    f"{len(rep['splits'])} 段")
             return rep
 
-        # ── 跨活动趋势 ──
-        start = (datetime.now().date() - timedelta(days=max(7, range_days))).isoformat()
-        acts = [dict(r) for r in conn.execute(
-            "SELECT id, substr(start_time,1,10) AS day, sport_id, distance_km "
-            "FROM activities WHERE sport_id='run' AND substr(start_time,1,10) >= ? "
-            "AND distance_km >= ? ORDER BY start_time",
-            (start, min_distance_km)).fetchall()]
-        weekly: dict = {}
-        for a in acts:
-            rep = grademod.analyze_activity(conn, a["id"])
-            if not rep.get("splits"):
-                continue
-            wk = _iso_week(a["day"])
-            bucket = weekly.setdefault(wk, {
-                "week": wk, "runs": 0, "distance_km": 0.0,
-                "gain_m": 0.0, "d_m": 0.0,
-                "gap_num": 0.0, "actual_num": 0.0, "responses": []})
-            sm = rep["summary"]
-            bucket["runs"] += 1
-            bucket["distance_km"] += sm.get("distance_km") or 0
-            bucket["gain_m"] += sm.get("elevation_gain_m") or 0
-            for sp in rep["splits"]:
-                if sp.get("gap_pace_min_km") and sp.get("distance_m"):
-                    bucket["gap_num"] += sp["gap_pace_min_km"] * sp["distance_m"]
-                    bucket["actual_num"] += (sp["pace_min_km"] or 0) * sp["distance_m"]
-                    bucket["d_m"] += sp["distance_m"]
-            resp = rep.get("grade_pace_response")
-            if _usable_grade_response(resp):
-                bucket["responses"].append(resp["sec_per_1pct_grade"])
-
-        out = []
-        for wk in sorted(weekly):
-            b = weekly[wk]
-            item = {
-                "week": b["week"],
-                "runs": b["runs"],
-                "distance_km": round(b["distance_km"], 1),
-                "elevation_gain_m": round(b["gain_m"], 1),
-                "climb_density_m_per_km": round(b["gain_m"] / b["distance_km"], 1)
-                                          if b["distance_km"] else None,
-                "actual_pace": _fmt_pace(b["actual_num"] / b["d_m"])
-                               if b["d_m"] else None,
-                "gap_pace": _fmt_pace(b["gap_num"] / b["d_m"])
-                            if b["d_m"] else None,
-            }
-            if b["responses"]:
-                item["grade_response_sec_per_1pct"] = round(
-                    sum(b["responses"]) / len(b["responses"]), 1)
-            out.append(item)
-
+        # ── 跨活动统计 ──
         return {
             "range_days": range_days,
-            "min_distance_km": min_distance_km,
-            "weeks": out,
-            "note": "grade_response_sec_per_1pct 只在 r2>=0.15（坡度确实解释配速变化）的"
-                    "跑步上取平均，用于观察爬坡能力随训练的变化趋势；数值下降=爬坡变强。",
+            "overall": grademod.pooled_grade_response(conn, range_days=max(range_days, 365)),
+            "period_compare": grademod.period_compare(conn, recent_weeks=8),
+            "weeks": grademod.weekly_terrain(conn, range_days=range_days),
+            "scope_note": (
+                "overall 用全周期（≥365 天）池化，样本量足够，斜率可信；"
+                "period_compare 每侧需 ≥40 个上坡段才给结论，否则标 insufficient；"
+                "weeks 只给分段级地形构成与爬升量，不给每周斜率——"
+                "单周上坡段只有 5–15 个，斜率会在 −8~+51 间乱跳，是噪声不是趋势。"),
         }
     finally:
         conn.close()
-
-
-def _usable_grade_response(resp) -> bool:
-    """只有坡度确实解释配速变化时才采信（否则拟合斜率是噪声，会出现 ±400 s/%）。"""
-    if not resp:
-        return False
-    r2 = resp.get("r2")
-    sl = resp.get("sec_per_1pct_grade")
-    span = resp.get("grade_span_pct")
-    if r2 is None or sl is None or span is None:
-        return False
-    return r2 >= 0.30 and span >= 1.5 and -5.0 <= sl <= 60.0
-
-
-def _iso_week(day: str) -> str:
-    d = date.fromisoformat(day[:10])
-    iso = d.isocalendar()
-    return f"{iso[0]}-W{iso[1]:02d}"
 
 
 @mcp.tool()

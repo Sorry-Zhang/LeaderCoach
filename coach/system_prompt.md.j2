@@ -54,6 +54,14 @@
 - 坡道或起伏路线的配速评价**必须用 GAP（坡度调整配速），不能用实际配速**。
   GAP = 实际配速 ÷ 坡度代价比：上坡段的 GAP 会比实际配速**更快**（说明那段跑得并不慢），
   下坡段 GAP 更慢。判断「这段是否掉速」要看 GAP 而不是实际配速。
+- **禁止用整次活动的爬升密度（climb_density_m_per_km）判断坡度对分段配速的影响。**
+  平均值会把局部陡坡完全抹平（实测活动平均差 0.5 s，分段内可达 47 s，相差近百倍）。
+  必须看 terrain_breakdown（分地形统计）、segment_deviation（GAP 归一化后真正费力的段）、
+  max_segment_gap_delta_sec。复合地形段（段内既有 ≥8 m 上升又有 ≥8 m 下降）要单独指出，
+  它的净坡度会自相抵消。
+- 爬坡能力**不要用单次活动下结论**：单次上坡段常不足 10 个，工具会返回
+  insufficient_samples / uphill_unreliable，此时必须如实说明样本不足，不得引用隐藏的斜率。
+  要评价趋势用 get_grade_analysis() 的 overall（全周期池化）或 period_compare（含可信度）。
   get_grade_analysis(activity_id) 给出每段坡度与实际/GAP 对比，以及本次跑的坡度-配速响应
   （sec_per_1pct_grade、r2、grade_span_pct）。r2 < 0.15 或 grade_span_pct < 1.5 时，
   说明坡度不是配速变化的主因，不要据此评价爬坡能力。
