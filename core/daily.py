@@ -21,7 +21,7 @@ def _loads_by_day(conn, end_day: date, lookback: int = 120) -> dict:
     start = end_day - timedelta(days=lookback)
     rows = conn.execute(
         "SELECT substr(start_time,1,10) AS d, COALESCE(SUM(load_final),0) AS load "
-        "FROM activities WHERE start_time >= ? AND start_time <= ? "
+        "FROM activities WHERE substr(start_time,1,10) >= ? AND substr(start_time,1,10) <= ? "
         "GROUP BY substr(start_time,1,10)",
         (_iso(start), _iso(end_day)),
     ).fetchall()
@@ -248,7 +248,7 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
     recent = [dict(r) for r in conn.execute(
         "SELECT sport_id, substr(start_time,1,10) AS date, duration_min, rpe, srpe_au, "
         "hr_trimp, load_final, load_path_used, intensity_domain, mismatch_flag "
-        "FROM activities WHERE start_time <= ? ORDER BY start_time DESC LIMIT 10",
+        "FROM activities WHERE substr(start_time,1,10) <= ? ORDER BY start_time DESC LIMIT 10",
         (day,)).fetchall()]
     recent.reverse()
 

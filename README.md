@@ -57,7 +57,7 @@
 | 压力 / 身体电量 | `get_garmin_stress` / `_summaries` / `get_garmin_body_battery` | `stress_series`、`body_battery_series`、`daily_metrics.stress_daily_avg` |
 | 训练 | `get_garmin_training_readiness` / `daily_training_status` / `training_status` / `training_load_balance` / `max_metrics(_range)` / `race_predictions(_range)` | `garmin_metrics` + `official_snapshot` |
 | 其它 | 心率、步数、体重、训练库、个人资料 | `garmin_metrics` / 原始存档 |
-| 运动分段 | 本地 FIT 的 lap / split / 1 km 自动分段 | `activity_splits`（圈序号 + 配速/心率/爬升；明细存 `activities.annotation`） |
+| 运动分段 | 本地 FIT 的每公里分段 + 设备圈分段（**两套并存**） | `activity_split_detail`（每段距离/用时/配速/均心率/最高心率/爬升/起止时刻）+ 兼容副本 `activity_splits`；明细另存 `activities.annotation` |
 
 - 原始存档按 `tool/日期.json.gz` 保存（同名时更新为本轮返回）；解析器有变更时可
   `python -m ingest.plugin_full --replay` 用同一份存档重新解析回填。
@@ -198,6 +198,18 @@ tests/      引擎与 schema 测试
 
 ## 更新
 
+- 2026-11-05（v1.11）：**修复运动分段长期缺失**。三处根因与改动：
+  1. `core/store.py` 曾把 `start_time` 截成日期，导致 FIT 分段无法按开始时刻对齐活动
+     → 改为保留完整时间戳，并同步修正 `core/daily.py`、`mcp_server/tools.py` 里按日期
+     字符串比较的地方（改为 `substr(start_time,1,10)`）。
+  2. `ingest/fit_parser.py` 的 `rebuild_splits` 改为优先用 **FIT 文件名 = activityId**
+     匹配活动，回退到「时刻 ±90 min + 时长」打分匹配，并把 FIT 路径回写 `activities.fit_path`。
+  3. 新增 `activity_split_detail` 表，**每公里与设备圈两套粒度并存**（旧表主键无法共存）。
+  另新增 MCP 工具 `get_activity_detail(activity_id, granularity="km|lap|auto")`，
+  返回每段距离/用时/配速/均心率/最高心率/爬升 + 前后半程配速对比；
+  `sync_garmin` 改为**默认异步 job**（返回 `job_id`，用 `get_sync_status` 轮询），
+  长同步不再阻塞对话。新增 `scripts/backfill_splits.py`、`scripts/fetch_fit.py`。
+  本次回填：分段 232 → 4,900+ 条，覆盖活动 42 → 537 个（88%）。
 - 2026-10-27（v1.10）：G8 改为观察模式——触发条件 `睡眠状态分 < min(个人 28 天 p10, 60)`，
   只写入 `garmin_metrics` 与简报、不改变训练；`sleep.g8_mode="enforce"` 才真正拦截。
 - 2026-10-27（v1.9）：新增睡眠状态评分 `core/sleep_health.py`（六维、个人需要量 7.5 h 可配）；

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -60,7 +62,8 @@ def _validation_ctx(conn, week_start: str) -> dict:
     ctl = _ctl_now(conn)
     prev = 0.0
     rows = conn.execute(
-        "SELECT COALESCE(SUM(load_final),0) s FROM activities WHERE start_time >= ? AND start_time < ?",
+        "SELECT COALESCE(SUM(load_final),0) s FROM activities "
+        "WHERE substr(start_time,1,10) >= ? AND substr(start_time,1,10) < ?",
         ((d - timedelta(days=7)).isoformat(), week_start)).fetchone()
     prev += rows["s"] or 0
     rows = conn.execute(
@@ -183,11 +186,96 @@ def get_sync_status() -> dict:
             "activity_count": conn.execute("SELECT COUNT(*) c FROM activities").fetchone()["c"],
             "strength_count": conn.execute("SELECT COUNT(*) c FROM strength_sessions").fetchone()["c"],
             "coverage": store_ext.stats(conn),
+            "sync_jobs": _recent_sync_jobs(3),
         }
     finally:
         conn.close()
 
-def _run_sync_blocking(days: int, download_fit: bool, full: bool = True):
+# ── 异步同步 job：长任务不再阻塞 MCP 调用 ─────────────────────
+_SYNC_JOBS: dict = {}
+_SYNC_LOCK = threading.Lock()
+_SYNC_KEEP = 20
+
+
+def _recent_sync_jobs(n: int = 3) -> list:
+    with _SYNC_LOCK:
+        jobs = sorted(_SYNC_JOBS.values(), key=lambda j: j.get("started_at") or "", reverse=True)
+        out = []
+        for j in jobs[:n]:
+            item = {k: j.get(k) for k in
+                    ("job_id", "status", "started_at", "finished_at", "days",
+                     "download_fit", "full", "error", "elapsed_s")}
+            res = j.get("result")
+            if res:
+                item["result"] = {k: res.get(k) for k in (
+                    "mode", "activities", "inserted", "splits", "fit_files",
+                    "days", "raw_written", "coverage", "full_error") if k in res}
+            out.append(item)
+        return out
+
+
+def _sync_job(job_id: str) -> Optional[dict]:
+    with _SYNC_LOCK:
+        j = _SYNC_JOBS.get(job_id)
+        return dict(j) if j else None
+
+
+def _finalize_sync(box: dict, days: int) -> dict:
+    """同步收尾：写 last_sync_at、取覆盖度、附带回退错误。"""
+    result = dict(box.get("result") or {})
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('last_sync_at',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (datetime.now().isoformat(timespec="seconds"),))
+        conn.commit()
+        from core import store_ext
+        coverage = store_ext.stats(conn)
+    finally:
+        conn.close()
+    if box.get("full_error"):
+        result["full_error"] = box["full_error"]
+    result["requested_days"] = days
+    result["coverage"] = coverage
+    return result
+
+
+def _start_sync_job(days: int, download_fit: bool, full: bool) -> dict:
+    jid = f"sync-{datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    started = datetime.now()
+    with _SYNC_LOCK:
+        if len(_SYNC_JOBS) > _SYNC_KEEP:
+            for k in sorted(_SYNC_JOBS, key=lambda k: _SYNC_JOBS[k].get("started_at") or "")[:-_SYNC_KEEP]:
+                _SYNC_JOBS.pop(k, None)
+        _SYNC_JOBS[jid] = {"job_id": jid, "status": "running", "days": days,
+                           "download_fit": bool(download_fit), "full": bool(full),
+                           "started_at": started.isoformat(timespec="seconds")}
+
+    def _worker():
+        try:
+            box = _run_sync_blocking(days, download_fit, full=full, timeout=7200)
+            res = _finalize_sync(box, days)
+            with _SYNC_LOCK:
+                _SYNC_JOBS[jid].update(
+                    status="done", result=res,
+                    finished_at=datetime.now().isoformat(timespec="seconds"),
+                    elapsed_s=round((datetime.now() - started).total_seconds(), 1))
+        except BaseException as e:  # noqa: BLE001
+            with _SYNC_LOCK:
+                _SYNC_JOBS[jid].update(
+                    status="failed", error=f"{type(e).__name__}: {e}",
+                    finished_at=datetime.now().isoformat(timespec="seconds"),
+                    elapsed_s=round((datetime.now() - started).total_seconds(), 1))
+
+    threading.Thread(target=_worker, daemon=True, name=jid).start()
+    return {"job_id": jid, "status": "running", "days": days,
+            "started_at": started.isoformat(timespec="seconds"),
+            "hint": "同步已在后台启动，不会阻塞对话。用 get_sync_status() 轮询同名 job_id，"
+                    "status=done 时看 result（splits 为本次回填的分段条数）。"}
+
+
+def _run_sync_blocking(days: int, download_fit: bool, full: bool = True, timeout: int = 1800):
     """在独立线程中执行同步：MCP 工具运行在事件循环内，不能直接 asyncio.run。
 
     full=True 走 ingest.plugin_full（插件全部只读工具 + 原始存档）；
@@ -237,42 +325,35 @@ def _run_sync_blocking(days: int, download_fit: bool, full: bool = True):
 
     th = threading.Thread(target=_worker, daemon=True)
     th.start()
-    th.join(timeout=1800)
+    th.join(timeout=timeout)
     if th.is_alive():
-        raise TimeoutError("Garmin 同步超过 1800 秒未完成")
+        raise TimeoutError(f"Garmin 同步超过 {timeout} 秒未完成")
     if "error" in box:
         raise RuntimeError(box["error"])
     return box
 
 
 @mcp.tool()
-def sync_garmin(days: int = 30, download_fit: bool = False, full: bool = True) -> dict:
+def sync_garmin(days: int = 30, download_fit: bool = False, full: bool = True,
+                wait: bool = False) -> dict:
     """从 Garmin 插件拉取最近 N 天的数据并写入本地数据库。
+
+    **默认异步**（wait=False）：立即返回 job_id，后台线程执行，不阻塞对话；
+    用 get_sync_status() 轮询 job_status（status=done 时看 result）。
+    需要一次性结果时传 wait=True（会最长阻塞到超时，慎用）。
 
     full=True（默认）调用插件的**全部只读工具**：活动（完整详情）、睡眠、心率、步数、体重、
     HRV 摘要与夜间读数、压力/身体电量时序、训练准备度、训练状态、负荷平衡、VO2max、
     比赛预测、训练库、个人资料；原始返回 gzip 存档到 archive/plugin_raw；另用本地 FIT 回填
     运动分段（lap/1km）。睡眠阶段时间线来自 SDK 直读（插件 get_garmin_sleep 不含）。
     full=False 走旧的 plugin_bridge 最小路径。
+
+    download_fit=True 会为当期活动下载缺失的 FIT（分段回填需要它）。
     """
+    if not wait:
+        return _start_sync_job(days, download_fit, full)
     box = _run_sync_blocking(days, download_fit, full=full)
-    result = box["result"]
-    conn = _conn()
-    try:
-        conn.execute(
-            "INSERT INTO meta(key,value) VALUES('last_sync_at',?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (datetime.now().isoformat(timespec="seconds"),))
-        conn.commit()
-        from core import store_ext
-        coverage = store_ext.stats(conn)
-    finally:
-        conn.close()
-    if box.get("full_error"):
-        result["full_error"] = box["full_error"]
-    result["requested_days"] = days
-    result["coverage"] = coverage
-    return result
+    return _finalize_sync(box, days)
 
 
 @mcp.tool()
@@ -334,6 +415,164 @@ def get_activities(date_range: int = 14, sport_id: Optional[str] = None) -> list
                 "load_path_used, intensity_domain, mismatch_flag, annotation "
                 "FROM activities WHERE start_time>=? ORDER BY start_time", (start,)).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+# ── 分段读取：get_activity_detail ─────────────────────────────
+
+def _fmt_pace(pace_min_km) -> Optional[str]:
+    """配速（min/km）→ 'm:ss'；0 或空返回 None。"""
+    if not pace_min_km or pace_min_km <= 0:
+        return None
+    sec = int(round(float(pace_min_km) * 60))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def _resolve_activity(conn, activity_id):
+    """activity_id 可为本地整数 id、Garmin activityId，或 'plugin:<id>' 形式。"""
+    key = str(activity_id).strip()
+    try:
+        row = conn.execute("SELECT * FROM activities WHERE id=?", (int(key),)).fetchone()
+        if row:
+            return row
+    except (TypeError, ValueError):
+        pass
+    clean = key.split("@")[0].replace("plugin:", "").strip()
+    for cand in (key, clean, f"plugin:{clean}"):
+        row = conn.execute(
+            "SELECT * FROM activities WHERE garmin_activity_id=? ORDER BY id DESC LIMIT 1",
+            (cand,)).fetchone()
+        if row:
+            return row
+    return None
+
+
+def _backfill_one(conn, row) -> int:
+    """库里没有分段时，就地用本地 FIT 补一份（不联网）。返回写入条数。"""
+    from pathlib import Path as _P
+    cfg = _cfg
+    candidates = []
+    if row["fit_path"]:
+        candidates.append(_P(row["fit_path"]))
+    gid = (row["garmin_activity_id"] or "").replace("plugin:", "").strip()
+    if gid.isdigit():
+        fit_root = _P(cfg["garmin_plugin"].get("fit_dir") or "data/garmin_fit")
+        if not fit_root.is_absolute():
+            fit_root = _P(cfg["_root"]) / fit_root
+        if fit_root.exists():
+            candidates.extend(fit_root.rglob(f"{gid}.fit"))
+    files = [f for f in candidates if f and f.exists()]
+    if not files:
+        return 0
+    try:
+        from ingest import fit_parser
+        return fit_parser.rebuild_splits(cfg, files, conn=conn)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+@mcp.tool()
+def get_activity_detail(activity_id: str, granularity: str = "auto",
+                        backfill: bool = True) -> dict:
+    """单次活动的完整明细，重点是**分段数据**（每段距离/用时/配速/均心率/最高心率/爬升）。
+
+    activity_id：本地活动 id（如 "685"）、Garmin activityId（如 "658766818"），
+    或 get_activities 返回的 garmin_activity_id 形式（"plugin:658766818"）。
+
+    granularity：
+      - "km"   → 每公里分段（做后程掉速、配速稳定性分析用这个）
+      - "lap"  → 设备圈分段（手动/自动圈，含每圈起止时刻）
+      - "auto" → 有圈分段就返回圈，否则返回公里分段（默认）
+
+    backfill=True 时，如果库里还没有分段，会尝试用本地 FIT 文件即时补写。
+    返回 summary（总距离/总时长/均配速/均心率）+ splits（分段列表）+
+    split_summary（前/后半程配速对比、最快最慢公里、掉速率）；无数据时给出说明。
+    """
+    conn = _conn()
+    try:
+        row = _resolve_activity(conn, activity_id)
+        if not row:
+            return {"error": "E_NOT_FOUND",
+                    "message": f"找不到活动 {activity_id}，先用 get_activities 查 id"}
+        aid = row["id"]
+        g = (granularity or "auto").lower()
+
+        def _load(types):
+            marks = ",".join("?" * len(types))
+            detail = [dict(r) for r in conn.execute(
+                "SELECT seq, distance_m, duration_s, pace_min_km, avg_hr, max_hr, "
+                "elevation_gain_m, split_type, start_time, end_time, source "
+                "FROM activity_split_detail WHERE activity_id=? AND split_type IN (" + marks + ") "
+                "ORDER BY seq", (aid, *types)).fetchall()]
+            if detail:
+                return detail
+            # 兼容：只有旧表数据时（split_type 未知，按长度推断）
+            return [dict(r) for r in conn.execute(
+                "SELECT km AS seq, distance_m, duration_s, pace_min_km, avg_hr, max_hr, "
+                "elevation_gain_m, split_type, start_time, end_time, source "
+                "FROM activity_splits WHERE activity_id=? AND split_type IN (" + marks + ") "
+                "ORDER BY km", (aid, *types)).fetchall()]
+
+        if g == "lap":
+            rows = _load(("lap",))
+        elif g == "km":
+            rows = _load(("km", "auto"))
+        else:
+            rows = _load(("lap",)) or _load(("km", "auto"))
+
+        filled = 0
+        if not rows and backfill:
+            filled = _backfill_one(conn, row)
+            if filled:
+                rows = (_load(("lap",)) if g == "lap"
+                        else _load(("km", "auto")) or _load(("lap",)))
+
+        for r in rows:
+            r["pace"] = _fmt_pace(r.get("pace_min_km"))
+        km_rows = [r for r in rows if r.get("split_type") in ("km", "auto")]
+
+        summary = {
+            "id": aid,
+            "garmin_activity_id": row["garmin_activity_id"],
+            "start_time": row["start_time"],
+            "sport_id": row["sport_id"],
+            "distance_km": row["distance_km"],
+            "duration_min": row["duration_min"],
+            "avg_pace": _fmt_pace(row["avg_pace_min_km"]),
+            "avg_hr": row["avg_hr"],
+            "max_hr": row["max_hr"],
+            "elevation_gain_m": row["elevation_gain_m"],
+        }
+
+        out = {"summary": summary, "granularity": g, "split_count": len(rows), "splits": rows}
+        if filled:
+            out["backfilled_splits"] = filled
+
+        if not rows:
+            out["message"] = (
+                "该活动还没有分段数据。可用 sync_garmin(download_fit=true) 下载 FIT 后重试，"
+                "或确认 data/garmin_fit 下存在 <garminActivityId>.fit。")
+            return out
+
+        if km_rows:
+            paces = [(r["seq"], r["pace_min_km"]) for r in km_rows if r.get("pace_min_km")]
+            if paces:
+                half = len(paces) // 2
+                first = sum(p for _, p in paces[:half]) / max(1, half)
+                second = sum(p for _, p in paces[half:]) / max(1, len(paces) - half)
+                fastest = min(paces, key=lambda x: x[1])
+                slowest = max(paces, key=lambda x: x[1])
+                out["split_summary"] = {
+                    "first_half_avg_pace": _fmt_pace(first),
+                    "second_half_avg_pace": _fmt_pace(second),
+                    "second_half_drift_sec_per_km": round((second - first) * 60, 1),
+                    "fastest_km": fastest[0], "fastest_pace": _fmt_pace(fastest[1]),
+                    "slowest_km": slowest[0], "slowest_pace": _fmt_pace(slowest[1]),
+                    "pace_range_sec_per_km": round((slowest[1] - fastest[1]) * 60, 1),
+                }
+        _audit(conn, "get_activity_detail",
+               {"activity_id": activity_id, "granularity": g}, "ok", f"{len(rows)} 段")
+        return out
     finally:
         conn.close()
 

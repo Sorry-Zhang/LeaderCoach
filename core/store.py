@@ -21,7 +21,11 @@ def _luteal_today(conn, day: str) -> bool:
     return cyclemod.is_luteal(date.fromisoformat(day[:10]), periods)
 
 def insert_activity(conn, cfg: dict, act: dict) -> int:
-    start = (act.get("start_time") or "")[:10]
+    # 保留完整时间戳（YYYY-MM-DD HH:MM:SS）；只有日期时退化为日期。
+    # 曾在此处截断成 [:10]，导致 FIT 分段回填无法按开始时刻与活动对齐（分段数长期卡死）。
+    raw_start = (act.get("start_time") or "").strip()
+    start = raw_start[:19] if len(raw_start) >= 19 else raw_start[:10]
+    day = raw_start[:10]
     prof = _profile(conn)
     hr_rest = prof["hr_rest"] if prof else None
     hr_max = prof["hr_max"] if prof else None
@@ -34,10 +38,10 @@ def insert_activity(conn, cfg: dict, act: dict) -> int:
     rpe = act.get("rpe")
     duration = act.get("duration_min")
     load = compute_activity_load(rpe, duration, act.get("avg_hr"), hr_rest, hr_max,
-                                 k_bridge, hr_cross, _luteal_today(conn, start), cfg)
+                                 k_bridge, hr_cross, _luteal_today(conn, day), cfg)
     domain = intensity_domain(rpe=rpe)
 
-    gid = act.get("garmin_activity_id") or act.get("fit_path") or f"manual:{start}:{sport_id}"
+    gid = act.get("garmin_activity_id") or act.get("fit_path") or f"manual:{day}:{sport_id}"
     params = (
         gid, act.get("fit_path"), start, sport_id, duration,
         act.get("distance_km"), act.get("avg_hr"), act.get("max_hr"),
@@ -73,7 +77,7 @@ def insert_activity(conn, cfg: dict, act: dict) -> int:
     conn.commit()
     row = conn.execute("SELECT id FROM activities WHERE garmin_activity_id=?", (gid,)).fetchone()
     try:
-        dailymod.compute_engine_daily(conn, cfg, start)
+        dailymod.compute_engine_daily(conn, cfg, day)
     except Exception:
         pass
     return row["id"]

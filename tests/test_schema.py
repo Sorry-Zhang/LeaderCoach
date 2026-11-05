@@ -23,11 +23,14 @@ def test_init_21_tables():
         assert res == "ok"
 
         conn = dbmod.get_conn(cfg)
-        tables = conn.execute(
-            "SELECT count(*) c FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%'").fetchone()["c"]
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
         conn.close()
-        assert tables == 21, f"预期 21 表，实际 {tables}"
+        # v1.7 基础表 21 张 + core/store_ext.py 追加的扩展表
+        assert len(names) >= 21, f"预期至少 21 表，实际 {len(names)}"
+        for must in ("activities", "activity_splits", "activity_split_detail",
+                     "daily_metrics", "plugin_raw", "garmin_metrics"):
+            assert must in names, f"缺少表 {must}"
 
         assert dbmod.check_version(cfg) is None
     finally:

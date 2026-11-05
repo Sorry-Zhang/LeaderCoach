@@ -48,13 +48,51 @@ DDL = (
     "CREATE TABLE IF NOT EXISTS garmin_activities ("
     " activity_id TEXT PRIMARY KEY, activity_name TEXT, sport_key TEXT,"
     " start_local TEXT, updated_at TEXT)",
+    # 运动分段明细：同一活动可同时保存「每公里」与「设备圈」两套粒度。
+    # v1.7 的 activity_splits 以 (activity_id, km) 为主键，无法并存两套分段；
+    # 这里用独立自增 id + (activity_id, split_type, seq) 唯一键替代，原表继续保留。
+    "CREATE TABLE IF NOT EXISTS activity_split_detail ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT, activity_id INTEGER NOT NULL,"
+    " split_type TEXT NOT NULL, seq INTEGER NOT NULL,"
+    " distance_m REAL, duration_s REAL, pace_min_km REAL,"
+    " avg_hr INTEGER, max_hr INTEGER, elevation_gain_m REAL,"
+    " start_time TEXT, end_time TEXT, source TEXT,"
+    " UNIQUE(activity_id, split_type, seq))",
+    "CREATE INDEX IF NOT EXISTS idx_split_detail_act "
+    "ON activity_split_detail(activity_id, split_type, seq)",
 )
 
 
 def ensure(conn) -> None:
     for stmt in DDL:
         conn.execute(stmt)
+    _migrate_split_columns(conn)
     conn.commit()
+
+
+# activity_splits 在 v1.7 里只存 km/pace/avg_hr/elev。分段读取工具需要每段的
+# 距离、计时时长、最高心率与起止时刻，因此以 ADD COLUMN 幂等追加（不改原 DDL）。
+_SPLIT_COLUMNS = (
+    ("distance_m", "REAL"),
+    ("duration_s", "REAL"),
+    ("max_hr", "INTEGER"),
+    ("split_type", "TEXT"),      # lap | km | auto | interval
+    ("start_time", "TEXT"),      # 该段开始（本地时间）
+    ("end_time", "TEXT"),        # 该段结束（本地时间）
+    ("source", "TEXT"),          # fit | garmin_api | manual
+)
+
+
+def _migrate_split_columns(conn) -> None:
+    try:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(activity_splits)")}
+    except Exception:  # noqa: BLE001
+        return
+    if not have:
+        return
+    for name, ddl in _SPLIT_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE activity_splits ADD COLUMN {name} {ddl}")
 
 
 def _now() -> str:
@@ -330,5 +368,8 @@ def stats(conn) -> dict:
         "garmin_metric_days": one("SELECT COUNT(DISTINCT date) FROM garmin_metrics"),
         "garmin_metric_names": one("SELECT COUNT(DISTINCT metric) FROM garmin_metrics"),
         "activity_splits": one("SELECT COUNT(*) FROM activity_splits"),
+        "activity_split_detail": one("SELECT COUNT(*) FROM activity_split_detail"),
+        "activities_with_splits": one(
+            "SELECT COUNT(DISTINCT activity_id) FROM activity_split_detail"),
         "raw_payloads": one("SELECT COUNT(*) FROM plugin_raw"),
     }
