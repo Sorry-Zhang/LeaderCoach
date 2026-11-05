@@ -71,9 +71,24 @@ def test_grade_adjusted_pace_flat_unchanged():
     assert abs(grade.grade_adjusted_pace(5.0, 1.0) - 5.0) < 1e-9
 
 
-def test_grade_adjusted_pace_slower_uphill():
+def test_grade_adjusted_pace_faster_uphill():
+    # 上坡代价比 >1 → 等效平路配速更快（同样用力在平路能跑更快）
     gap = grade.grade_adjusted_pace(5.0, 1.3)
+    assert gap < 5.0
+    assert abs(gap - 5.0 / 1.3) < 1e-3
+
+
+def test_grade_adjusted_pace_slower_easy_downhill():
+    gap = grade.grade_adjusted_pace(5.0, 0.8)
     assert gap > 5.0
+
+
+def test_grade_adjusted_pace_uphill_matches_energy_balance():
+    # 能量速率守恒：Cr(g)·v_g = Cr(0)·v_flat → pace_flat = pace_g · Cr(0)/Cr(g)
+    g = 0.05
+    pace = 5.0
+    expect = pace * grade.CR_FLAT / grade.minetti_cost(g)
+    assert abs(grade.grade_adjusted_pace_by_grade(pace, g) - expect) < 1e-3
 
 
 def test_grade_adjusted_pace_handles_missing():
@@ -84,7 +99,7 @@ def test_grade_adjusted_pace_handles_missing():
 
 def test_grade_adjusted_pace_by_grade_matches_ratio():
     g = 0.05
-    expect = 5.0 * grade.minetti_cost(g) / grade.CR_FLAT
+    expect = 5.0 * grade.CR_FLAT / grade.minetti_cost(g)
     assert abs(grade.grade_adjusted_pace_by_grade(5.0, g) - expect) < 1e-3
 
 

@@ -8,8 +8,12 @@
 2. **坡度调整配速（GAP）** 用 Minetti et al. (2002) 跑步代谢代价方程：
         Cr(i) = 155.4·i⁵ − 30.4·i⁴ − 43.3·i³ + 46.3·i² + 19.5·i + 3.6   [J·kg⁻¹·m⁻¹]
    i 为坡度小数（上坡为正），平地 Cr(0) = 3.6。
-   一段路线的等效平地配速：
-        GAP = 实际配速 × (距离加权平均 Cr / Cr(0))
+   等效平地配速的推导（能量速率守恒）：
+        Cr(i)·v_actual = Cr(0)·v_flat   →   v_flat = v_actual · Cr(i)/Cr(0)
+        配速是速度的倒数，因此   GAP = 实际配速 ÷ (Cr(i)/Cr(0))
+   即 ratio = Cr(i)/Cr(0) 是「代价比」，GAP = 实际配速 / ratio。
+   上坡 ratio>1 → GAP 比实际配速快（同样用力在平路能跑更快）；
+   缓下坡 ratio<1 → GAP 比实际配速慢。
    含义：扣掉坡度影响后再比较，才能公平判断「同样用力跑得快不快」。
 
 参考：Minetti AE, et al. Energy cost of walking and running at extreme uphill and
@@ -161,10 +165,13 @@ def segment_stats(pts: list[tuple[float, float]],
 
 def grade_adjusted_pace(pace_min_km: Optional[float],
                         cost_ratio: Optional[float]) -> Optional[float]:
-    """实际配速 × 代价比 = 等效平地配速（min/km）。"""
+    """等效平地配速（min/km）= 实际配速 ÷ 代价比。
+
+    cost_ratio = Cr(坡度)/Cr(平地)，上坡 >1。由能量速率守恒推出（见模块 docstring）。
+    """
     if not pace_min_km or pace_min_km <= 0 or not cost_ratio:
         return None
-    return round(pace_min_km * cost_ratio, 3)
+    return round(pace_min_km / cost_ratio, 3)
 
 
 def grade_adjusted_pace_by_grade(pace_min_km: Optional[float],
@@ -172,7 +179,7 @@ def grade_adjusted_pace_by_grade(pace_min_km: Optional[float],
     """只有平均坡度、没有逐点数据时的近似 GAP。"""
     if not pace_min_km or pace_min_km <= 0 or avg_grade is None:
         return None
-    return round(pace_min_km * minetti_cost(avg_grade) / CR_FLAT, 3)
+    return round(pace_min_km / (minetti_cost(avg_grade) / CR_FLAT), 3)
 
 
 # ── 活动级坡度-配速分析 ────────────────────────────────────────
