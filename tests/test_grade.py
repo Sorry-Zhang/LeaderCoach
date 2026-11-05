@@ -220,3 +220,124 @@ def test_terrain_breakdown_groups_by_label():
     assert out["climb"]["segments"] == 1
     assert out["descent"]["segments"] == 1
     assert out["climb"]["gap_pace"] == "4:48"
+
+
+# ── RPE 定位与睡眠感受折算（回归测试）─────────────────────────
+
+def _tmp_db():
+    import shutil
+    import tempfile
+    from pathlib import Path
+    from core import db as dbmod
+    root = Path(__file__).resolve().parent.parent
+    tmp = Path(tempfile.mkdtemp(prefix="coach_rpe_"))
+    (tmp / "db").mkdir()
+    shutil.copy(root / "db" / "schema.sql", tmp / "db" / "schema.sql")
+    shutil.copy(root / "db" / "seed.sql", tmp / "db" / "seed.sql")
+    # 用真实配置（RPE 计算依赖 load/learning 等段），只把库指到临时目录
+    from core.config import load_config
+    base = load_config()
+    cfg = {**base, "_root": str(tmp), "paths": dict(base["paths"], db="db/coach.db")}
+    dbmod.init_db(cfg)
+    return tmp, cfg, dbmod.get_conn(cfg)
+
+
+def test_rpe_requires_activity_id_when_same_day_multiple():
+    from core import store
+    tmp, cfg, conn = _tmp_db()
+    try:
+        for t in ("08:45:53", "16:52:07", "17:39:30"):
+            conn.execute(
+                "INSERT INTO activities(start_time, sport_id, duration_min, distance_km) "
+                "VALUES(?,?,?,?)", (f"2026-11-05 {t}", "run", 40.0, 10.0))
+        conn.commit()
+        try:
+            store.log_activity_rpe(conn, cfg, "2026-11-05", "run", 5)
+            assert False, "同日多条同类活动时应拒绝猜测"
+        except LookupError as e:
+            assert "无法确定写哪一条" in str(e)
+    finally:
+        conn.close()
+
+
+def test_rpe_with_activity_id_targets_exactly_that_row():
+    from core import store
+    tmp, cfg, conn = _tmp_db()
+    try:
+        ids = []
+        for t in ("08:45:53", "16:52:07", "17:39:30"):
+            cur = conn.execute(
+                "INSERT INTO activities(start_time, sport_id, duration_min, distance_km) "
+                "VALUES(?,?,?,?)", (f"2026-11-05 {t}", "run", 40.0, 10.0))
+            ids.append(cur.lastrowid)
+        conn.commit()
+        res = store.log_activity_rpe(conn, cfg, "2026-11-05", "run", 5,
+                                     activity_id=ids[0])
+        assert res["activity_id"] == ids[0]
+        rows = {r["id"]: r["rpe"] for r in conn.execute(
+            "SELECT id, rpe FROM activities")}
+        assert rows[ids[0]] == 5
+        assert rows[ids[1]] is None and rows[ids[2]] is None
+    finally:
+        conn.close()
+
+
+def test_rpe_refuses_silent_overwrite():
+    from core import store
+    tmp, cfg, conn = _tmp_db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO activities(start_time, sport_id, duration_min, distance_km) "
+            "VALUES(?,?,?,?)", ("2026-11-05 17:39:30", "run", 40.0, 10.0))
+        aid = cur.lastrowid
+        conn.commit()
+        store.log_activity_rpe(conn, cfg, "2026-11-05", "run", 4, activity_id=aid)
+        try:
+            store.log_activity_rpe(conn, cfg, "2026-11-05", "run", 5, activity_id=aid)
+            assert False, "已写入的活动不应静默覆盖"
+        except ValueError as e:
+            assert "已有 RPE" in str(e)
+        # 显式 overwrite 才能改
+        store.log_activity_rpe(conn, cfg, "2026-11-05", "run", 5,
+                               activity_id=aid, overwrite=True)
+        assert conn.execute("SELECT rpe FROM activities WHERE id=?",
+                            (aid,)).fetchone()["rpe"] == 5
+    finally:
+        conn.close()
+
+
+def test_rpe_rejects_date_mismatch():
+    from core import store
+    tmp, cfg, conn = _tmp_db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO activities(start_time, sport_id, duration_min, distance_km) "
+            "VALUES(?,?,?,?)", ("2026-11-05 08:45:53", "run", 40.0, 10.0))
+        aid = cur.lastrowid
+        conn.commit()
+        try:
+            store.log_activity_rpe(conn, cfg, "2026-11-04", "run", 5, activity_id=aid)
+            assert False, "日期不一致应报错"
+        except LookupError as e:
+            assert "不一致" in str(e)
+    finally:
+        conn.close()
+
+
+def test_sleep_feel_accepts_1_to_10_and_converts():
+    from mcp_server.tools import _normalize_sleep_feel
+    # 1–5 直接透传
+    assert _normalize_sleep_feel(3) == (3, False, 3.0)
+    assert _normalize_sleep_feel(5) == (5, False, 5.0)
+    # 6–10 按规则 A 折算，与历史数据一致的映射
+    assert _normalize_sleep_feel(7)[0] == 4
+    assert _normalize_sleep_feel(8)[0] == 4
+    assert _normalize_sleep_feel(10)[0] == 5
+    assert _normalize_sleep_feel(6)[0] == 3
+    # 越界拒绝
+    for bad in (0, 11, -1):
+        try:
+            _normalize_sleep_feel(bad)
+            assert False, f"{bad} 应被拒绝"
+        except ValueError:
+            pass

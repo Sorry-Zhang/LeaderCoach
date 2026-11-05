@@ -82,12 +82,53 @@ def insert_activity(conn, cfg: dict, act: dict) -> int:
         pass
     return row["id"]
 
-def log_activity_rpe(conn, cfg: dict, day: str, sport_id: str, rpe: int) -> int:
-    row = conn.execute(
-        "SELECT id FROM activities WHERE substr(start_time,1,10)=? AND sport_id=? "
-        "ORDER BY start_time DESC LIMIT 1", (day, sport_id)).fetchone()
-    if not row:
+def resolve_rpe_target(conn, day: str, sport_id: str,
+                       activity_id=None) -> dict:
+    """定位 RPE 要写到哪条活动。
+
+    同一天同一运动类型可能有多条（早课/下午课/晚课），仅凭「日期+运动类型」
+    无法区分——旧实现固定取 start_time 最新的一条，连续录入时会反复覆盖同一条。
+    因此：给了 activity_id 就精确定位；没给时若候选不唯一，**抛歧义错误并列出候选**，
+    而不是猜一条。
+    """
+    if activity_id is not None:
+        try:
+            key = int(str(activity_id).strip())
+        except (TypeError, ValueError):
+            raise LookupError(f"activity_id 必须是数字，收到 {activity_id!r}") from None
+        row = conn.execute("SELECT * FROM activities WHERE id=?", (key,)).fetchone()
+        if not row:
+            raise LookupError(f"没有 id={key} 的活动")
+        if (row["start_time"] or "")[:10] != day[:10]:
+            raise LookupError(
+                f"活动 id={key} 的日期是 {row['start_time'][:10]}，与传入 date={day} 不一致")
+        return dict(row)
+
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM activities WHERE substr(start_time,1,10)=? AND sport_id=? "
+        "ORDER BY start_time", (day, sport_id)).fetchall()]
+    if not rows:
         raise LookupError(f"{day} 没有 {sport_id} 的活动，无法录入 RPE")
+    if len(rows) > 1:
+        cands = [{"activity_id": r["id"], "start_time": r["start_time"],
+                  "distance_km": r["distance_km"], "duration_min": r["duration_min"],
+                  "rpe": r["rpe"]} for r in rows]
+        raise LookupError(
+            f"{day} 有 {len(rows)} 条 {sport_id} 活动，无法确定写哪一条，"
+            f"请传 activity_id。候选：{json.dumps(cands, ensure_ascii=False)}")
+    return rows[0]
+
+
+def log_activity_rpe(conn, cfg: dict, day: str, sport_id: str, rpe: int,
+                     activity_id=None, overwrite: bool = False) -> dict:
+    """写入单次活动的 RPE。返回被命中的活动信息（便于调用方核对）。"""
+    act_row = resolve_rpe_target(conn, day, sport_id, activity_id)
+    if act_row["rpe"] is not None and not overwrite:
+        raise ValueError(
+            f"活动 id={act_row['id']}（{act_row['start_time'][:16]}，"
+            f"{act_row['distance_km']} km）已有 RPE={act_row['rpe']}。"
+            "如需覆盖请传 overwrite=true。")
+    row = act_row
     prof = _profile(conn)
     act = conn.execute("SELECT * FROM activities WHERE id=?", (row["id"],)).fetchone()
     k_bridge, _ = learning.k_bridge_for(conn, sport_id, cfg)
@@ -104,7 +145,10 @@ def log_activity_rpe(conn, cfg: dict, day: str, sport_id: str, rpe: int) -> int:
          intensity_domain(rpe=rpe), load["mismatch_flag"], _now(), row["id"]))
     conn.commit()
     dailymod.compute_engine_daily(conn, cfg, day)
-    return row["id"]
+    return {"activity_id": row["id"], "start_time": row["start_time"],
+            "sport_id": row["sport_id"], "distance_km": row["distance_km"],
+            "duration_min": row["duration_min"], "rpe": rpe,
+            "srpe_au": load["srpe_au"], "load_final": load["load_final"]}
 
 def upsert_subjective(conn, day: str, soreness, sleep_feel, note, injury_flag: bool,
                       alcohol_units=None, caffeine_mg=None, stress=None) -> None:

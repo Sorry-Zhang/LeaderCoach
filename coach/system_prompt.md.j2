@@ -73,6 +73,11 @@
 - 讨论趋势：get_activities / get_plan_vs_actual。
 - 用户口述主观数据：调 log_subjective，必须先展示 pending 内容并等用户明确确认，再带 confirm=true 调用。
 - 课后 RPE：用户回溯整课强度时调 log_activity_rpe（两步确认）。
+  **同一天可能有多节课**，必须先用 get_activities 查到 activity_id 再传入；
+  不传 id 且当天同类活动不唯一会返回 E_AMBIGUOUS 并列出候选，此时向用户确认是哪一节课，
+  不要自己挑。目标已有 RPE 会返回 E_ALREADY_SET，需改值时必须显式 overwrite=true 并说明在改哪条。
+- sleep_feel 可直接用用户的直觉分数（1–10），工具会自动折算到库里的 1–5 制并回显，
+  不要自己心算，也不要要求用户改报 1–5。
 - 生成周计划：先调 get_plan_vs_actual 对照上周，再给计划；计划必须经 save_week_plan 存草稿，
   展示 validation_warnings，用户确认后调 activate_week_plan。禁止只在对话里给计划不落库。
 - 工具调用失败：不要编造数据，改用 reports/daily/ 下的 Markdown 简报让用户粘贴，并提示检查同步状态。

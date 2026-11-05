@@ -60,6 +60,11 @@ DDL = (
     " UNIQUE(activity_id, split_type, seq))",
     "CREATE INDEX IF NOT EXISTS idx_split_detail_act "
     "ON activity_split_detail(activity_id, split_type, seq)",
+    # 同步任务历史：MCP 进程重启后仍可回溯（内存里的 job 表会随进程消失）
+    "CREATE TABLE IF NOT EXISTS sync_jobs ("
+    " job_id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT,"
+    " finished_at TEXT, elapsed_s REAL, days INTEGER, download_fit INTEGER,"
+    " full INTEGER, error TEXT, result TEXT)",
 )
 
 

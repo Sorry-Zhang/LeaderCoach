@@ -176,13 +176,19 @@ def get_sync_status() -> dict:
     conn = _conn()
     try:
         last_sync = conn.execute("SELECT value FROM meta WHERE key='last_sync_at'").fetchone()
-        brief = dailymod.build_daily_brief(conn, _cfg)
-        logging = brief["data_quality"]["logging"]
+        # 固定用当天，并把日期一并返回：与 get_daily_brief 同源同参，
+        # 避免两边口径不一致（曾经出现过 streak/last_input 两边不同的情况）。
+        day = datetime.now().date().isoformat()
+        brief = dailymod.build_daily_brief(conn, _cfg, day)
+        logging = dict(brief["data_quality"]["logging"])
+        logging["as_of"] = day
         from core import store_ext
+        # sqlite3.Row 不能直接序列化（会变成 "<sqlite3.Row object at 0x...>"）
+        obs = conn.execute("SELECT value FROM meta WHERE key='obs_state'").fetchone()
         return {
             "last_sync_at": last_sync["value"] if last_sync else None,
             "logging": logging,
-            "obs_state": conn.execute("SELECT value FROM meta WHERE key='obs_state'").fetchone(),
+            "obs_state": obs["value"] if obs else None,
             "activity_count": conn.execute("SELECT COUNT(*) c FROM activities").fetchone()["c"],
             "strength_count": conn.execute("SELECT COUNT(*) c FROM strength_sessions").fetchone()["c"],
             "coverage": store_ext.stats(conn),
@@ -197,27 +203,96 @@ _SYNC_LOCK = threading.Lock()
 _SYNC_KEEP = 20
 
 
-def _recent_sync_jobs(n: int = 3) -> list:
+def _sync_job_persist(conn, j: dict) -> None:
+    """把同步任务状态写进 sync_jobs 表，进程重启后仍可回溯。"""
+    try:
+        res = j.get("result")
+        conn.execute(
+            "INSERT INTO sync_jobs(job_id, status, started_at, finished_at, elapsed_s, "
+            "days, download_fit, full, error, result) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, "
+            "finished_at=excluded.finished_at, elapsed_s=excluded.elapsed_s, "
+            "error=excluded.error, result=excluded.result",
+            (j["job_id"], j.get("status"), j.get("started_at"), j.get("finished_at"),
+             j.get("elapsed_s"), j.get("days"), int(bool(j.get("download_fit"))),
+             int(bool(j.get("full"))), j.get("error"),
+             json.dumps(res, ensure_ascii=False) if res else None))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sync_job_write(j: dict) -> None:
+    try:
+        conn = _conn()
+        try:
+            _sync_job_persist(conn, j)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sync_job_summary(j: dict) -> dict:
+    """只保留关键字段，result 里的 coverage 太大，挑有用的部分返回。"""
+    item = {k: j.get(k) for k in
+            ("job_id", "status", "started_at", "finished_at", "days",
+             "download_fit", "full", "error", "elapsed_s")}
+    res = j.get("result")
+    if isinstance(res, str):
+        try:
+            res = json.loads(res)
+        except (TypeError, ValueError):
+            res = None
+    if res:
+        item["result"] = {k: res.get(k) for k in (
+            "mode", "activities", "inserted", "splits", "fit_files",
+            "days", "raw_written", "full_error") if k in res}
+        cov = res.get("coverage") or {}
+        if cov:
+            item["result"]["coverage"] = {
+                k: cov.get(k) for k in ("activities_with_splits", "activity_split_detail")
+                if k in cov}
+    return item
+
+
+def _recent_sync_jobs(n: int = 5) -> list:
+    """优先读内存（当前进程的活跃任务），再并入数据库历史，去重后按时间倒序。"""
+    merged: dict = {}
     with _SYNC_LOCK:
-        jobs = sorted(_SYNC_JOBS.values(), key=lambda j: j.get("started_at") or "", reverse=True)
-        out = []
-        for j in jobs[:n]:
-            item = {k: j.get(k) for k in
-                    ("job_id", "status", "started_at", "finished_at", "days",
-                     "download_fit", "full", "error", "elapsed_s")}
-            res = j.get("result")
-            if res:
-                item["result"] = {k: res.get(k) for k in (
-                    "mode", "activities", "inserted", "splits", "fit_files",
-                    "days", "raw_written", "coverage", "full_error") if k in res}
-            out.append(item)
-        return out
+        for j in _SYNC_JOBS.values():
+            merged[j["job_id"]] = dict(j)
+    try:
+        conn = _conn()
+        try:
+            for r in conn.execute(
+                    "SELECT * FROM sync_jobs ORDER BY started_at DESC LIMIT ?", (n * 3,)):
+                d = dict(r)
+                if d["job_id"] not in merged:
+                    merged[d["job_id"]] = d
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    ordered = sorted(merged.values(),
+                     key=lambda j: j.get("started_at") or "", reverse=True)
+    return [_sync_job_summary(j) for j in ordered[:n]]
 
 
 def _sync_job(job_id: str) -> Optional[dict]:
     with _SYNC_LOCK:
         j = _SYNC_JOBS.get(job_id)
-        return dict(j) if j else None
+        if j:
+            return dict(j)
+    try:
+        conn = _conn()
+        try:
+            r = conn.execute("SELECT * FROM sync_jobs WHERE job_id=?", (job_id,)).fetchone()
+            return dict(r) if r else None
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _finalize_sync(box: dict, days: int) -> dict:
@@ -251,6 +326,15 @@ def _start_sync_job(days: int, download_fit: bool, full: bool) -> dict:
         _SYNC_JOBS[jid] = {"job_id": jid, "status": "running", "days": days,
                            "download_fit": bool(download_fit), "full": bool(full),
                            "started_at": started.isoformat(timespec="seconds")}
+    try:
+        conn = _conn()
+        try:
+            _sync_job_persist(conn, _SYNC_JOBS[jid])
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
 
     def _worker():
         try:
@@ -261,12 +345,16 @@ def _start_sync_job(days: int, download_fit: bool, full: bool) -> dict:
                     status="done", result=res,
                     finished_at=datetime.now().isoformat(timespec="seconds"),
                     elapsed_s=round((datetime.now() - started).total_seconds(), 1))
+                snap = dict(_SYNC_JOBS[jid])
+            _sync_job_write(snap)
         except BaseException as e:  # noqa: BLE001
             with _SYNC_LOCK:
                 _SYNC_JOBS[jid].update(
                     status="failed", error=f"{type(e).__name__}: {e}",
                     finished_at=datetime.now().isoformat(timespec="seconds"),
                     elapsed_s=round((datetime.now() - started).total_seconds(), 1))
+                snap = dict(_SYNC_JOBS[jid])
+            _sync_job_write(snap)
 
     threading.Thread(target=_worker, daemon=True, name=jid).start()
     return {"job_id": jid, "status": "running", "days": days,
@@ -719,22 +807,59 @@ def get_learning_status() -> dict:
     finally:
         conn.close()
 
+def _normalize_sleep_feel(v):
+    """sleep_feel 入参统一成库里约定的 1–5 制。
+
+    用户直觉常报「8/10」，早期靠人工按规则 A 折算（6–10 → 3–5），既易错又没留痕。
+    现在直接接受 1–10：>5 视为 10 分制，按 round(v/2) 折算并夹到 1–5。
+    返回 (落库值, 是否折算, 原始值)。
+    """
+    if v is None:
+        return None, False, None
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"sleep_feel 必须是数字，收到 {v!r}") from None
+    if 1 <= n <= 5:
+        return int(round(n)), False, n
+    if 1 <= n <= 10:
+        return max(1, min(5, int(round(n / 2)))), True, n
+    raise ValueError(f"sleep_feel 必须在 1–10 之间，收到 {v!r}")
+
+
 @mcp.tool()
 def log_subjective(date: str, soreness: int, sleep_feel: int, injury_flag: bool,
                    note: Optional[str] = None, confirm: bool = False,
                    confirm_code: Optional[str] = None) -> dict:
+    """记录当日主观状态。
+
+    soreness：0–10（与用户直觉一致）。
+    sleep_feel：**接受 1–10 或 1–5**。>5 视为 10 分制，自动折算到库里的 1–5 制
+    （规则 A：round(v/2)，夹到 1–5），折算结果与原始值都会回显。
+    """
+    raw_sleep = sleep_feel
+    try:
+        sleep_feel, converted, raw_sleep = _normalize_sleep_feel(sleep_feel)
+    except ValueError as e:
+        return {"error": "E_PARAM", "message": str(e)}
     conn = _conn()
     try:
         params = {"date": date, "soreness": soreness, "sleep_feel": sleep_feel,
-                  "injury_flag": injury_flag, "note": note}
+                  "sleep_feel_input": raw_sleep, "injury_flag": injury_flag, "note": note}
         needs_code = bool(injury_flag) or _upgrade_s2(conn)
         if not confirm:
             _, code = _store.open("log_subjective", params, needs_code)
             if needs_code:
                 notifymod.notify(_cfg, f"确认码：{code}（录入主观）", kind="code")
             _audit(conn, "log_subjective", params, "E_CONFIRM_REQUIRED", "待确认")
-            msg = "确认码已推送到您的设备，请念给我" if needs_code else \
-                f"待写：{date} 酸痛 {soreness}/10，睡眠感受 {sleep_feel}/5，伤病旗 {injury_flag}。请用户确认后重调。"
+            sleep_txt = f"睡眠感受 {sleep_feel}/5"
+            if converted:
+                sleep_txt += f"（你给的是 {raw_sleep:g}/10，已折算）"
+            if needs_code:
+                msg = "确认码已推送到您的设备，请念给我"
+            else:
+                msg = (f"待写：{date} 酸痛 {soreness}/10，{sleep_txt}，"
+                       f"伤病旗 {injury_flag}。请用户确认后重调。")
             return {"error": "E_CONFIRM_REQUIRED", "message": msg}
         res = _store.consume("log_subjective", params, confirm_code)
         if not res["ok"]:
@@ -743,7 +868,11 @@ def log_subjective(date: str, soreness: int, sleep_feel: int, injury_flag: bool,
         store.upsert_subjective(conn, date, soreness, sleep_feel, note, injury_flag)
         dailymod.compute_engine_daily(conn, _cfg, date)
         _audit(conn, "log_subjective", params, "ok", "已保存")
-        return {"ok": True, "date": date}
+        out = {"ok": True, "date": date, "soreness": soreness, "sleep_feel": sleep_feel}
+        if converted:
+            out["sleep_feel_input"] = raw_sleep
+            out["sleep_feel_note"] = (f"输入 {raw_sleep:g}/10 已折算为 {sleep_feel}/5（库里统一 1–5 制）")
+        return out
     finally:
         conn.close()
 
@@ -778,11 +907,39 @@ def log_strength(date: str, exercise_id: str, pattern: str, sets: int, reps: int
         conn.close()
 
 @mcp.tool()
-def log_activity_rpe(date: str, sport_id: str, rpe: int, confirm: bool = False,
+def log_activity_rpe(date: str, sport_id: str, rpe: int,
+                     activity_id: Optional[str] = None, overwrite: bool = False,
+                     confirm: bool = False,
                      confirm_code: Optional[str] = None) -> dict:
+    """给某次活动录 RPE（1–10），并按 sRPE 重算当日训练负荷。
+
+    **同一天同一运动类型常有多条活动**（早课/下午课/晚课），只有 date+sport_id 无法区分。
+    因此：
+      - 传 activity_id（get_activities 返回的 id）→ 精确定位；
+      - 不传且当天同类活动不唯一 → 返回 E_AMBIGUOUS 并列出候选，不会随便挑一条写；
+      - 目标活动已有 RPE → 返回 E_ALREADY_SET，需显式 overwrite=true 才覆盖。
+
+    返回值包含被命中的 activity_id / start_time / distance_km，便于核对。
+    """
     conn = _conn()
     try:
-        params = {"date": date, "sport_id": sport_id, "rpe": rpe}
+        params = {"date": date, "sport_id": sport_id, "rpe": rpe,
+                  "activity_id": activity_id, "overwrite": overwrite}
+        # 先校验目标活动再走确认流程：否则用户念完确认码才被告知"歧义/已存在"，
+        # 白白多一轮交互。
+        try:
+            probe = store.resolve_rpe_target(conn, date, sport_id, activity_id)
+        except LookupError as e:
+            msg = str(e)
+            code = "E_AMBIGUOUS" if "无法确定写哪一条" in msg else "E_NOT_FOUND"
+            _audit(conn, "log_activity_rpe", params, code, msg[:200])
+            return {"error": code, "message": msg}
+        if probe["rpe"] is not None and not overwrite:
+            msg = (f"活动 id={probe['id']}（{probe['start_time'][:16]}，"
+                   f"{probe['distance_km']} km）已有 RPE={probe['rpe']}。"
+                   "如需覆盖请传 overwrite=true。")
+            _audit(conn, "log_activity_rpe", params, "E_ALREADY_SET", msg[:200])
+            return {"error": "E_ALREADY_SET", "message": msg}
         needs_code = _upgrade_s2(conn)
         if not confirm:
             _, code = _store.open("log_activity_rpe", params, needs_code)
@@ -797,12 +954,20 @@ def log_activity_rpe(date: str, sport_id: str, rpe: int, confirm: bool = False,
             _audit(conn, "log_activity_rpe", params, res["error"], res.get("message", ""))
             return {"error": res["error"], "message": res.get("message", "")}
         try:
-            aid = store.log_activity_rpe(conn, _cfg, date, sport_id, rpe)
+            res_act = store.log_activity_rpe(conn, _cfg, date, sport_id, rpe,
+                                             activity_id=activity_id,
+                                             overwrite=overwrite)
         except LookupError as e:
-            _audit(conn, "log_activity_rpe", params, "E_NOT_FOUND", str(e))
-            return {"error": "E_NOT_FOUND", "message": str(e)}
-        _audit(conn, "log_activity_rpe", params, "ok", "已保存")
-        return {"ok": True, "activity_id": aid}
+            msg = str(e)
+            code = "E_AMBIGUOUS" if "无法确定写哪一条" in msg else "E_NOT_FOUND"
+            _audit(conn, "log_activity_rpe", params, code, msg[:200])
+            return {"error": code, "message": msg}
+        except ValueError as e:
+            _audit(conn, "log_activity_rpe", params, "E_ALREADY_SET", str(e)[:200])
+            return {"error": "E_ALREADY_SET", "message": str(e)}
+        _audit(conn, "log_activity_rpe", params, "ok",
+               f"活动 {res_act['activity_id']} RPE {rpe}")
+        return {"ok": True, **res_act}
     finally:
         conn.close()
 

@@ -283,6 +283,11 @@ tests/      引擎与 schema 测试
 
 ## 更新
 
+- 2026-11-05（v1.13）：`log_activity_rpe` 新增 `activity_id`（同日多课时定位到指定活动，
+  歧义时返回 `E_AMBIGUOUS` 并列出候选、已有 RPE 返回 `E_ALREADY_SET` 需 `overwrite=true`），
+  返回体带上被命中的活动信息；`log_subjective.sleep_feel` 接受 1–10 并自动折算到 1–5；
+  修复 `get_sync_status` 的 `obs_state` 序列化（原为 `sqlite3.Row` 对象）与 `logging`
+  口径（固定当天并回显 `as_of`）；同步任务历史落库到 `sync_jobs`，进程重启后仍可回溯。
 - 2026-11-05（v1.12）：新增 `core/grade.py` 坡度-配速分析（Minetti GAP、分段地形分类、
   跨活动池化的上坡惩罚/下坡收益）；新增 MCP 工具 `get_grade_analysis`；分段覆盖补齐至
   568/569 个活动；合并 39 组 CSV/插件重复活动（负荷字段迁移后删记录）。
