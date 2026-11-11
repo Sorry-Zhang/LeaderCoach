@@ -289,6 +289,9 @@ tests/      引擎与 schema 测试
 
 ## 更新
 
+- 2026-11-11（v1.14）：修复僵尸同步任务。进程中途退出后，`sync_jobs` 里的 `running`
+  不会结束，状态面板一直显示「同步卡住」。现在启动时与 `get_sync_status` 读取前会回收：
+  内存中不存在、且启动超过 30 分钟的 `running` 记为 `interrupted`。同步改为串行执行。
 - 2026-11-05（v1.13）：`log_activity_rpe` 新增 `activity_id`（同日多课时定位到指定活动，
   歧义时返回 `E_AMBIGUOUS` 并列出候选、已有 RPE 返回 `E_ALREADY_SET` 需 `overwrite=true`），
   返回体带上被命中的活动信息；`log_subjective.sleep_feel` 接受 1–10 并自动折算到 1–5；

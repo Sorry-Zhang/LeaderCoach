@@ -185,6 +185,7 @@ def get_sync_status() -> dict:
         from core import store_ext
         # sqlite3.Row 不能直接序列化（会变成 "<sqlite3.Row object at 0x...>"）
         obs = conn.execute("SELECT value FROM meta WHERE key='obs_state'").fetchone()
+        _reconcile_sync_jobs(conn)
         return {
             "last_sync_at": last_sync["value"] if last_sync else None,
             "logging": logging,
@@ -201,6 +202,58 @@ def get_sync_status() -> dict:
 _SYNC_JOBS: dict = {}
 _SYNC_LOCK = threading.Lock()
 _SYNC_KEEP = 20
+# 同一时刻只允许一个真实同步在跑：并发同步会抢同一个插件会话/写同一批表，
+# 既容易互相覆盖，也会让日志互相串味。后来的任务排队等锁，状态仍显示 running。
+_SYNC_RUN_LOCK = threading.Lock()
+# 进程被杀（重启/崩溃）时后台线程会一起消失，sync_jobs 里就留下永久的
+# "running" 僵尸行。启动时把「内存里没有 + 已启动超过阈值」的 running 收成
+# interrupted，避免状态面板永远显示「同步卡住」。
+_STALE_JOB_MINUTES = 30
+
+
+def _reconcile_sync_jobs(conn=None) -> int:
+    """回收僵尸同步任务：内存中不存在、且启动超过阈值的 running 行记为 interrupted。"""
+    owned = set()
+    with _SYNC_LOCK:
+        owned = {k for k, v in _SYNC_JOBS.items() if v.get("status") == "running"}
+    cutoff = (datetime.now() - timedelta(minutes=_STALE_JOB_MINUTES)).isoformat(timespec="seconds")
+    sql = ("SELECT job_id, started_at FROM sync_jobs WHERE status='running' "
+           "AND COALESCE(started_at,'') < ?")
+    own_conn = conn is None
+    try:
+        c = _conn() if own_conn else conn
+    except Exception:  # noqa: BLE001
+        return 0
+    try:
+        rows = [r for r in c.execute(sql, (cutoff,)) if r["job_id"] not in owned]
+        if not rows:
+            return 0
+        now = datetime.now().isoformat(timespec="seconds")
+        for r in rows:
+            c.execute(
+                "UPDATE sync_jobs SET status='interrupted', finished_at=?, "
+                "error=? WHERE job_id=? AND status='running'",
+                (now, "进程在同步过程中退出，任务中断（启动时自动回收）", r["job_id"]))
+        c.commit()
+        return len(rows)
+    except Exception:  # noqa: BLE001
+        try:
+            c.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+    finally:
+        if own_conn:
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+try:  # 模块导入即执行一次：MCP 进程启动后状态面板立刻干净
+    _reconcile_sync_jobs()
+except Exception:  # noqa: BLE001
+    pass
 
 
 def _sync_job_persist(conn, j: dict) -> None:
@@ -338,7 +391,8 @@ def _start_sync_job(days: int, download_fit: bool, full: bool) -> dict:
 
     def _worker():
         try:
-            box = _run_sync_blocking(days, download_fit, full=full, timeout=7200)
+            with _SYNC_RUN_LOCK:  # 串行执行，避免两个同步抢同一个插件会话
+                box = _run_sync_blocking(days, download_fit, full=full, timeout=7200)
             res = _finalize_sync(box, days)
             with _SYNC_LOCK:
                 _SYNC_JOBS[jid].update(
