@@ -23,6 +23,13 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .db import active_source
+
+def _src(cfg: dict | None = None) -> str:
+    """当前生效数据源（坡度池化统计按源隔离）。"""
+    return active_source(cfg)
+
+
 # 计入爬升的最小累计高度（米）：低于此视为噪声。
 # FIT 的 enhanced_altitude 是气压高度，分辨率 0.1 m、采样约 4 m，
 # 实测 1–1.5 m 阈值与 Garmin 官方 total_ascent 最接近（3 m 会低估 20–40%）。
@@ -437,8 +444,9 @@ def _collect_pooled(conn, range_days: int, min_dist_m: float, min_grade_pct: flo
     from datetime import date as _date, timedelta as _td
     start = (_date.today() - _td(days=max(30, range_days))).isoformat()
     acts = [dict(r) for r in conn.execute(
-        "SELECT id, start_time FROM activities WHERE sport_id='run' "
-        "AND substr(start_time,1,10) >= ? ORDER BY start_time", (start,)).fetchall()]
+        "SELECT id, start_time FROM activities WHERE source=? AND sport_id='run' "
+        "AND substr(start_time,1,10) >= ? ORDER BY start_time",
+        (_src(), start)).fetchall()]
 
     buckets: dict = {}
     n_acts = n_segs = n_skipped = 0
@@ -526,9 +534,9 @@ def period_compare(conn, recent_weeks: int = 8, min_dist_m: float = 300.0,
 
     def _run(start: str, end: str) -> dict:
         acts = [dict(r) for r in conn.execute(
-            "SELECT id, start_time FROM activities WHERE sport_id='run' "
+            "SELECT id, start_time FROM activities WHERE source=? AND sport_id='run' "
             "AND substr(start_time,1,10) >= ? AND substr(start_time,1,10) < ? "
-            "ORDER BY start_time", (start, end)).fetchall()]
+            "ORDER BY start_time", (_src(), start, end)).fetchall()]
         up, down, allp = [], [], []
         n_acts = 0
         for a in acts:
@@ -599,8 +607,9 @@ def weekly_terrain(conn, range_days: int = 90, min_dist_m: float = 300.0) -> lis
     from datetime import date as _date, timedelta as _td
     start = (_date.today() - _td(days=max(7, range_days))).isoformat()
     acts = [dict(r) for r in conn.execute(
-        "SELECT id, start_time FROM activities WHERE sport_id='run' "
-        "AND substr(start_time,1,10) >= ? ORDER BY start_time", (start,)).fetchall()]
+        "SELECT id, start_time FROM activities WHERE source=? AND sport_id='run' "
+        "AND substr(start_time,1,10) >= ? ORDER BY start_time",
+        (_src(), start)).fetchall()]
     buckets: dict = {}
     for a in acts:
         rep = analyze_activity(conn, a["id"], min_split_m=min_dist_m)

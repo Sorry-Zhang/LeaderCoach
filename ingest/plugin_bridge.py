@@ -195,7 +195,8 @@ def _insert_activities(conn, acts: list) -> int:
             sport = "other"
         dur_min = round(dur_s / 60.0, 2)
         hit = conn.execute(
-            "SELECT id FROM activities WHERE substr(start_time,1,10)=? AND sport_id=? "
+            "SELECT id FROM activities WHERE source='garmin' "
+            "AND substr(start_time,1,10)=? AND sport_id=? "
             "AND ABS(duration_min-?) < 1.0", (day, sport, dur_min)).fetchone()
         if hit:
             continue

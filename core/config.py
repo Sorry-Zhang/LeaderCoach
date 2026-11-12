@@ -49,6 +49,10 @@ DEFAULTS: dict = {
     "confirm": {"code_length": 4, "ttl_seconds": 300, "max_attempts": 3},
     "llm": {"model_path": "local://", "context_window": 32768, "temperature": 0.4},
     "mcp": {"transport": "stdio"},
+    # 数据源隔离：不同设备的 HRV/静息心率定义不同，基线必须分开算。
+    # active 决定 get_daily_brief / 训练预测读哪个源；换设备时改这一行，
+    # 不自动推断（两台设备同时戴会一天一个口径）。
+    "source": {"active": "garmin"},
     "load": {
         "k_bridge_default": 2.6,
         "mismatch_tol": 0.40,

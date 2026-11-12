@@ -13,17 +13,25 @@ from .engine import (
 from . import cycle as cyclemod
 from . import sleep_health
 from . import store_ext
+from .db import active_source
 
 def _iso(d) -> str:
     return d.isoformat()
 
-def _loads_by_day(conn, end_day: date, lookback: int = 120) -> dict:
+def _src(cfg: dict | None) -> str:
+    """当前生效的数据源（[source] active）。所有基线窗口都按它隔离。"""
+    return active_source(cfg)
+
+def _loads_by_day(conn, end_day: date, lookback: int = 120, source: str = "garmin") -> dict:
+    """按天汇总负荷。activities 按 source 隔离（不同设备同一节课不重复计），
+    strength_sessions 是手工录入的体感负荷，与设备无关，不隔离。"""
     start = end_day - timedelta(days=lookback)
     rows = conn.execute(
         "SELECT substr(start_time,1,10) AS d, COALESCE(SUM(load_final),0) AS load "
-        "FROM activities WHERE substr(start_time,1,10) >= ? AND substr(start_time,1,10) <= ? "
+        "FROM activities WHERE source=? "
+        "AND substr(start_time,1,10) >= ? AND substr(start_time,1,10) <= ? "
         "GROUP BY substr(start_time,1,10)",
-        (_iso(start), _iso(end_day)),
+        (source, _iso(start), _iso(end_day)),
     ).fetchall()
     srows = conn.execute(
         "SELECT date AS d, COALESCE(SUM(srpe_au),0) AS load FROM strength_sessions "
@@ -37,8 +45,9 @@ def _loads_by_day(conn, end_day: date, lookback: int = 120) -> dict:
         out[r["d"]] = out.get(r["d"], 0.0) + (r["load"] or 0.0)
     return out
 
-def _load_series(conn, end_day: date, lookback: int = 120) -> list[float]:
-    by_day = _loads_by_day(conn, end_day, lookback)
+def _load_series(conn, end_day: date, lookback: int = 120,
+                 source: str = "garmin") -> list[float]:
+    by_day = _loads_by_day(conn, end_day, lookback, source)
     series = []
     d = end_day - timedelta(days=lookback)
     while d <= end_day:
@@ -47,7 +56,8 @@ def _load_series(conn, end_day: date, lookback: int = 120) -> list[float]:
     return series
 
 def _rolling_dev(conn, table_col: str, end_day: date, window: int = 14,
-                 ref_col: str | None = None) -> list[tuple[str, float | None, float | None]]:
+                 ref_col: str | None = None,
+                 source: str = "garmin") -> list[tuple[str, float | None, float | None]]:
     """返回 [(date, 主偏离%, 参考偏离%)]。
 
     主偏离用轮动 window 天均值作基线；参考偏离用 ref_col（如 Garmin balanced）
@@ -56,8 +66,9 @@ def _rolling_dev(conn, table_col: str, end_day: date, window: int = 14,
     start = end_day - timedelta(days=window * 2)
     cols = f"{table_col} AS v" + (f", {ref_col} AS ref" if ref_col else "")
     rows = conn.execute(
-        f"SELECT date, {cols} FROM daily_metrics WHERE date >= ? AND date <= ? ORDER BY date",
-        (_iso(start), _iso(end_day)),
+        f"SELECT date, {cols} FROM daily_metrics WHERE source=? "
+        "AND date >= ? AND date <= ? ORDER BY date",
+        (source, _iso(start), _iso(end_day)),
     ).fetchall()
     vals = [(r["date"], r["v"], r["ref"] if ref_col else None) for r in rows
             if r["v"] is not None]
@@ -72,9 +83,9 @@ def _rolling_dev(conn, table_col: str, end_day: date, window: int = 14,
         out.append((d, dev, ref_dev))
     return out
 
-def _metric_dev_series(conn, end_day: date) -> tuple[list, list]:
-    hrv = _rolling_dev(conn, "hrv_last_night", end_day, ref_col="hrv_baseline")
-    rhr = _rolling_dev(conn, "resting_hr", end_day)
+def _metric_dev_series(conn, end_day: date, source: str = "garmin") -> tuple[list, list]:
+    hrv = _rolling_dev(conn, "hrv_last_night", end_day, ref_col="hrv_baseline", source=source)
+    rhr = _rolling_dev(conn, "resting_hr", end_day, source=source)
     return hrv, rhr
 
 def _cycle_flags(conn, end_day: date, cfg: dict) -> dict:
@@ -84,7 +95,8 @@ def _cycle_flags(conn, end_day: date, cfg: dict) -> dict:
 
 def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
     end = date.fromisoformat(day[:10])
-    series = _load_series(conn, end)
+    src = _src(cfg)
+    series = _load_series(conn, end, source=src)
     fit = compute_fitness(series, cfg["fitness"]["tau_ctl"], cfg["fitness"]["tau_atl"])
     last = fit[-1]
     ctl, atl, tsb = last["ctl"], last["atl"], last["tsb"]
@@ -99,10 +111,11 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
         acwr = acwr_info["acwr"]
         ewma7, ewma28 = acwr_info["ewma7"], acwr_info["ewma28"]
 
-    dm = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (day,)).fetchone()
+    dm = conn.execute("SELECT * FROM daily_metrics WHERE source=? AND date=?",
+                      (src, day)).fetchone()
     sub = conn.execute("SELECT * FROM subjective WHERE date=?", (day,)).fetchone()
 
-    hrv_series, rhr_series = _metric_dev_series(conn, end)
+    hrv_series, rhr_series = _metric_dev_series(conn, end, source=src)
     hrv_dev = next((dev for d, dev, _ in hrv_series if d == day), None)
     hrv_dev_ref = next((ref for d, _, ref in hrv_series if d == day), None)
     rhr_dev = next((dev for d, dev, _ in rhr_series if d == day), None)
@@ -115,11 +128,12 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
 
     # 睡眠状态分：把睡眠折算成「今天恢复到什么程度」，替代单一时长阈值
     try:
-        sleep_state = sleep_health.evaluate(conn, cfg, day, sleep_feel)
+        sleep_state = sleep_health.evaluate(conn, cfg, day, sleep_feel, source=src)
     except Exception:  # noqa: BLE001
         sleep_state = {"date": day, "score": None, "confidence": "low", "dimensions": {},
                        "personal_need_h": None, "notes": ["睡眠模块计算失败"]}
-    sleep_state["percentile_28d"] = sleep_health.percentile(conn, day, sleep_state.get("score"))
+    sleep_state["percentile_28d"] = sleep_health.percentile(
+        conn, day, sleep_state.get("score"), source=src)
     sleep_state["g8"] = sleep_health.g8_status(conn, cfg, day, sleep_state.get("score"))
 
     weights = cfg["readiness"]["weights"]
@@ -182,7 +196,7 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
         flags.append("luteal_phase_confound")
 
     row = {
-        "date": day, "ctl": ctl, "atl": atl, "tsb": tsb, "acwr": acwr,
+        "source": src, "date": day, "ctl": ctl, "atl": atl, "tsb": tsb, "acwr": acwr,
         "ewma7": ewma7, "ewma28": ewma28,
         "readiness_score": readiness["score"], "readiness_confidence": readiness["confidence"],
         "pillars": json.dumps(readiness["pillars"], ensure_ascii=False),
@@ -196,8 +210,8 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
     cols = list(row.keys())
     conn.execute(
         f"INSERT INTO engine_daily({','.join(cols)}) VALUES({','.join('?' for _ in cols)}) "
-        "ON CONFLICT(date) DO UPDATE SET "
-        + ",".join(f"{c}=excluded.{c}" for c in cols if c != "date"),
+        "ON CONFLICT(source, date) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in cols if c not in ("source", "date")),
         [row[c] for c in cols],
     )
     conn.commit()
@@ -231,7 +245,8 @@ def compute_engine_daily(conn, cfg: dict, day: str) -> dict:
 def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
     day = day or date.today().isoformat()
     eng = compute_engine_daily(conn, cfg, day)
-    dm = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (day,)).fetchone()
+    dm = conn.execute("SELECT * FROM daily_metrics WHERE source=? AND date=?",
+                      (_src(cfg), day)).fetchone()
     sub = conn.execute("SELECT * FROM subjective WHERE date=?", (day,)).fetchone()
     body = conn.execute(
         "SELECT weight_7d_avg FROM body_metrics ORDER BY measured_at DESC LIMIT 1").fetchone()
@@ -248,8 +263,9 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
     recent = [dict(r) for r in conn.execute(
         "SELECT sport_id, substr(start_time,1,10) AS date, duration_min, rpe, srpe_au, "
         "hr_trimp, load_final, load_path_used, intensity_domain, mismatch_flag "
-        "FROM activities WHERE substr(start_time,1,10) <= ? ORDER BY start_time DESC LIMIT 10",
-        (day,)).fetchall()]
+        "FROM activities WHERE source=? AND substr(start_time,1,10) <= ? "
+        "ORDER BY start_time DESC LIMIT 10",
+        (_src(cfg), day)).fetchall()]
     recent.reverse()
 
     strength = [dict(r) for r in conn.execute(
@@ -282,9 +298,9 @@ def build_daily_brief(conn, cfg: dict, day: str | None = None) -> dict:
             "stress_daily_avg": dm["stress_daily_avg"] if dm else None,
             "data_status": dm["data_status"] if dm else "missing",
             # v1.8：插件全量采集的明细（无数据时为 None，不臆造）
-            "sleep_detail": _sleep_detail(conn, day),
+            "sleep_detail": _sleep_detail(conn, day, _src(cfg)),
             "overnight_series": _overnight_summary(conn, day),
-            "garmin_official": _garmin_metrics(conn, day),
+            "garmin_official": _garmin_metrics(conn, day, _src(cfg)),
             # v1.9：睡眠状态分（个人基线；决定当天训练安排的主要睡眠依据）
             "sleep_health": eng.get("sleep_health"),
         },
@@ -385,12 +401,12 @@ def _meso_states(conn) -> dict:
 
 # ── v1.8：插件全量数据的摘要（表不存在或没有数据时一律返回 None） ─────────
 
-def _sleep_detail(conn, day: str) -> dict | None:
+def _sleep_detail(conn, day: str, source: str = "garmin") -> dict | None:
     """夜间分段：只给"何时进入深睡/REM、醒了几次"这类教练需要的事件级摘要。"""
     try:
         rows = conn.execute(
             "SELECT stage, start_local, end_local, seconds FROM sleep_stages "
-            "WHERE date=? ORDER BY seq", (day,)).fetchall()
+            "WHERE source=? AND date=? ORDER BY seq", (source, day)).fetchall()
     except Exception:  # noqa: BLE001
         return None
     if not rows:
@@ -439,11 +455,12 @@ def _overnight_summary(conn, day: str) -> dict | None:
     return out
 
 
-def _garmin_metrics(conn, day: str) -> dict | None:
-    """Garmin 官方指标（隔离层：只作为参考，不参与自算准备度）。"""
+def _garmin_metrics(conn, day: str, source: str = "garmin") -> dict | None:
+    """厂商官方指标（隔离层：只作为参考，不参与自算准备度）。"""
     try:
         rows = conn.execute(
-            "SELECT metric, value, unit FROM garmin_metrics WHERE date=?", (day,)).fetchall()
+            "SELECT metric, value, unit FROM garmin_metrics WHERE source=? AND date=?",
+            (source, day)).fetchall()
     except Exception:  # noqa: BLE001
         return None
     if not rows:

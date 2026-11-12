@@ -29,6 +29,10 @@ _store = confirmmod.PendingStore(_cfg)
 def _conn():
     return dbmod.get_conn(_cfg)
 
+def _src(cfg: dict | None = None) -> str:
+    """当前生效数据源（[source] active）。"""
+    return dbmod.active_source(cfg or _cfg)
+
 def _audit(conn, tool, params, status, summary):
     dbmod.audit(conn, tool, "chat", params, status, summary)
 
@@ -62,9 +66,9 @@ def _validation_ctx(conn, week_start: str) -> dict:
     ctl = _ctl_now(conn)
     prev = 0.0
     rows = conn.execute(
-        "SELECT COALESCE(SUM(load_final),0) s FROM activities "
-        "WHERE substr(start_time,1,10) >= ? AND substr(start_time,1,10) < ?",
-        ((d - timedelta(days=7)).isoformat(), week_start)).fetchone()
+        "SELECT COALESCE(SUM(load_final),0) s FROM activities WHERE source=? "
+        "AND substr(start_time,1,10) >= ? AND substr(start_time,1,10) < ?",
+        (_src(), (d - timedelta(days=7)).isoformat(), week_start)).fetchone()
     prev += rows["s"] or 0
     rows = conn.execute(
         "SELECT COALESCE(SUM(srpe_au),0) s FROM strength_sessions WHERE date >= ? AND date < ?",
@@ -153,8 +157,8 @@ def get_plan_vs_actual(week_start: Optional[str] = None) -> dict:
             dd = date.fromisoformat(ws) + timedelta(days=list(days.keys()).index(day)) if False else _day_to_date(ws, day)
             planned = sum(s.get("planned_au", 0) for s in days[day].get("sessions", []))
             act = conn.execute(
-                "SELECT COALESCE(SUM(load_final),0) s FROM activities WHERE substr(start_time,1,10)=?",
-                (dd,)).fetchone()["s"]
+                "SELECT COALESCE(SUM(load_final),0) s FROM activities "
+                "WHERE source=? AND substr(start_time,1,10)=?", (_src(), dd)).fetchone()["s"]
             act += conn.execute(
                 "SELECT COALESCE(SUM(srpe_au),0) s FROM strength_sessions WHERE date=?", (dd,)).fetchone()["s"]
             planned_total += planned
@@ -190,9 +194,10 @@ def get_sync_status() -> dict:
             "last_sync_at": last_sync["value"] if last_sync else None,
             "logging": logging,
             "obs_state": obs["value"] if obs else None,
-            "activity_count": conn.execute("SELECT COUNT(*) c FROM activities").fetchone()["c"],
+            "activity_count": conn.execute(
+                "SELECT COUNT(*) c FROM activities WHERE source=?", (_src(),)).fetchone()["c"],
             "strength_count": conn.execute("SELECT COUNT(*) c FROM strength_sessions").fetchone()["c"],
-            "coverage": store_ext.stats(conn),
+            "coverage": store_ext.stats(conn, _src()),
             "sync_jobs": _recent_sync_jobs(3),
         }
     finally:
@@ -359,7 +364,7 @@ def _finalize_sync(box: dict, days: int) -> dict:
             (datetime.now().isoformat(timespec="seconds"),))
         conn.commit()
         from core import store_ext
-        coverage = store_ext.stats(conn)
+        coverage = store_ext.stats(conn, _src())
     finally:
         conn.close()
     if box.get("full_error"):
@@ -505,16 +510,17 @@ def get_sleep_detail(date: Optional[str] = None) -> dict:
     conn = _conn()
     try:
         d = (date or datetime.now().date().isoformat())[:10]
-        dm = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (d,)).fetchone()
+        dm = conn.execute("SELECT * FROM daily_metrics WHERE source=? AND date=?",
+                          (_src(), d)).fetchone()
         stages = [dict(r) for r in conn.execute(
             "SELECT seq, stage, start_local, end_local, seconds FROM sleep_stages "
-            "WHERE date=? ORDER BY seq", (d,)).fetchall()]
+            "WHERE source=? AND date=? ORDER BY seq", (_src(), d)).fetchall()]
         metrics = {r["metric"]: r["value"] for r in conn.execute(
-            "SELECT metric, value FROM garmin_metrics WHERE date=? AND ("
+            "SELECT metric, value FROM garmin_metrics WHERE source=? AND date=? AND ("
             "metric LIKE 'sleep%' OR metric LIKE 'avg_sleep%' OR metric LIKE 'avg_overnight%' "
             "OR metric LIKE 'respiration%' OR metric LIKE 'body_battery_change' "
             "OR metric LIKE 'restless%' OR metric LIKE 'awake_count' OR metric LIKE 'hrv_%')",
-            (d,)).fetchall()}
+            (_src(), d)).fetchall()}
         series = {}
         for r in conn.execute(
                 "SELECT kind, ts_local, value FROM sleep_series WHERE date=? ORDER BY kind, ts_local",
@@ -548,14 +554,15 @@ def get_activities(date_range: int = 14, sport_id: Optional[str] = None) -> list
                 "SELECT id, substr(start_time,1,10) AS date, sport_id, duration_min, distance_km, "
                 "avg_hr, max_hr, avg_pace_min_km, rpe, srpe_au, hr_trimp, load_final, "
                 "load_path_used, intensity_domain, mismatch_flag, annotation "
-                "FROM activities WHERE start_time>=? AND sport_id=? ORDER BY start_time",
-                (start, sport_id)).fetchall()
+                "FROM activities WHERE source=? AND start_time>=? AND sport_id=? "
+                "ORDER BY start_time", (_src(), start, sport_id)).fetchall()
         else:
             rows = conn.execute(
                 "SELECT id, substr(start_time,1,10) AS date, sport_id, duration_min, distance_km, "
                 "avg_hr, max_hr, avg_pace_min_km, rpe, srpe_au, hr_trimp, load_final, "
                 "load_path_used, intensity_domain, mismatch_flag, annotation "
-                "FROM activities WHERE start_time>=? ORDER BY start_time", (start,)).fetchall()
+                "FROM activities WHERE source=? AND start_time>=? ORDER BY start_time",
+                (_src(), start)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -583,6 +590,13 @@ def _resolve_activity(conn, activity_id):
     for cand in (key, clean, f"plugin:{clean}"):
         row = conn.execute(
             "SELECT * FROM activities WHERE garmin_activity_id=? ORDER BY id DESC LIMIT 1",
+            (cand,)).fetchone()
+        if row:
+            return row
+    # COROS 的 labelId 存在 external_id；按它也能定位（source 无关）
+    for cand in (key, clean):
+        row = conn.execute(
+            "SELECT * FROM activities WHERE external_id=? ORDER BY id DESC LIMIT 1",
             (cand,)).fetchone()
         if row:
             return row
@@ -982,7 +996,7 @@ def log_activity_rpe(date: str, sport_id: str, rpe: int,
         # 先校验目标活动再走确认流程：否则用户念完确认码才被告知"歧义/已存在"，
         # 白白多一轮交互。
         try:
-            probe = store.resolve_rpe_target(conn, date, sport_id, activity_id)
+            probe = store.resolve_rpe_target(conn, date, sport_id, activity_id, _cfg)
         except LookupError as e:
             msg = str(e)
             code = "E_AMBIGUOUS" if "无法确定写哪一条" in msg else "E_NOT_FOUND"

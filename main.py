@@ -199,9 +199,9 @@ def cmd_labels(cfg, args=None):
 
 def _upsert_daily(conn, s: dict):
     conn.execute(
-        "INSERT INTO daily_metrics(date, resting_hr, stress_daily_avg, hrv_last_night, hrv_baseline, "
-        "sleep_hours, sleep_deep_h, sleep_light_h, sleep_rem_h, sleep_awake_h) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET "
+        "INSERT INTO daily_metrics(source, date, resting_hr, stress_daily_avg, hrv_last_night, "
+        "hrv_baseline, sleep_hours, sleep_deep_h, sleep_light_h, sleep_rem_h, sleep_awake_h) "
+        "VALUES('garmin',?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source, date) DO UPDATE SET "
         "resting_hr=excluded.resting_hr, stress_daily_avg=excluded.stress_daily_avg, "
         "hrv_last_night=excluded.hrv_last_night, hrv_baseline=excluded.hrv_baseline, "
         "sleep_hours=excluded.sleep_hours, sleep_deep_h=excluded.sleep_deep_h, "

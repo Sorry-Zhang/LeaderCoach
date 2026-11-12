@@ -3,6 +3,12 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from .db import active_source
+
+def _src(cfg: dict | None = None) -> str:
+    """当前生效数据源。learning 的校准只应看同一台设备的数据。"""
+    return active_source(cfg)
+
 def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -21,12 +27,12 @@ def regress_k_bridge(pairs: list[tuple[float, float]]) -> dict | None:
     r2 = (1 - ssres / sstot) if sstot > 0 else 0.0
     return {"n": n, "slope": round(slope, 4), "r2": round(r2, 4)}
 
-def gather_pairs(conn, sport_id: str) -> list[tuple[float, float]]:
+def gather_pairs(conn, sport_id: str, cfg: dict | None = None) -> list[tuple[float, float]]:
     rows = conn.execute(
         "SELECT hr_trimp, srpe_au FROM activities "
-        "WHERE sport_id=? AND load_path_used='srpe' AND hr_trimp IS NOT NULL "
+        "WHERE source=? AND sport_id=? AND load_path_used='srpe' AND hr_trimp IS NOT NULL "
         "AND srpe_au IS NOT NULL AND hr_trimp > 0",
-        (sport_id,),
+        (_src(cfg), sport_id),
     ).fetchall()
     return [(float(r["hr_trimp"]), float(r["srpe_au"])) for r in rows]
 
@@ -40,7 +46,7 @@ def k_bridge_for(conn, sport_id: str, cfg: dict) -> tuple[float, str]:
     return float(cfg["load"]["k_bridge_default"]), "default"
 
 def update_k_bridge(conn, sport_id: str, cfg: dict) -> dict:
-    pairs = gather_pairs(conn, sport_id)
+    pairs = gather_pairs(conn, sport_id, cfg)
     reg = regress_k_bridge(pairs)
     lc = cfg["learning"]
     if reg is None:

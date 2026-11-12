@@ -49,7 +49,8 @@ def build_plan(conn, cfg, day: str, focus: str | None = None) -> dict:
         "forecast_history": _forecast_items(ed),
     }
     sport_hist = {r["sport_id"]: r["c"] for r in conn.execute(
-        "SELECT sport_id, COUNT(*) c FROM activities GROUP BY sport_id")}
+        "SELECT sport_id, COUNT(*) c FROM activities WHERE source=? GROUP BY sport_id",
+        (dbmod.active_source(cfg),))}
     sel = select_template(state, cfg)
     budget = budget_formula(ed["ctl"], 1.0)
     week = build_week(sel["template_id"], budget, cfg, t4_level=sel.get("t4_level"))

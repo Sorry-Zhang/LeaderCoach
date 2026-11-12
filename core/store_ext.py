@@ -33,13 +33,15 @@ DDL = (
     " PRIMARY KEY (date, ts_local))",
     # 睡眠分段（阶段时间线）：起 = sleepStartTimestampLocal + 前序阶段秒数
     "CREATE TABLE IF NOT EXISTS sleep_stages ("
-    " date TEXT NOT NULL, seq INTEGER NOT NULL, stage TEXT NOT NULL,"
+    " source TEXT NOT NULL DEFAULT 'garmin', date TEXT NOT NULL, seq INTEGER NOT NULL,"
+    " stage TEXT NOT NULL,"
     " start_local TEXT, end_local TEXT, seconds INTEGER NOT NULL,"
-    " PRIMARY KEY (date, seq))",
+    " PRIMARY KEY (source, date, seq))",
     # 官方快照明细（准备度 / 训练状态 / 负荷平衡 / VO2max / 比赛预测 / 心率 / 体重）
     "CREATE TABLE IF NOT EXISTS garmin_metrics ("
-    " date TEXT NOT NULL, metric TEXT NOT NULL, value REAL, unit TEXT,"
-    " captured_at TEXT, PRIMARY KEY (date, metric))",
+    " source TEXT NOT NULL DEFAULT 'garmin', date TEXT NOT NULL, metric TEXT NOT NULL,"
+    " value REAL, unit TEXT,"
+    " captured_at TEXT, PRIMARY KEY (source, date, metric))",
     # 夜间分钟级序列（来自 SDK 直读的每日睡眠原始 DTO）
     "CREATE TABLE IF NOT EXISTS sleep_series ("
     " date TEXT NOT NULL, kind TEXT NOT NULL, ts_local TEXT NOT NULL, value REAL,"
@@ -176,7 +178,7 @@ def replace_sleep_stages(conn, day: str, levels, start_local) -> int:
     Garmin 的 sleepLevels 是活动水平码（activityLevel: 0=深睡, 1=浅睡, 2=REM, 3=清醒），
     不是"睡眠等级"。若上游给的是 {startGMT, endGMT} 则按时间切段，否则按秒数累积推算。
     """
-    conn.execute("DELETE FROM sleep_stages WHERE date=?", (day,))
+    conn.execute("DELETE FROM sleep_stages WHERE source='garmin' AND date=?", (day,))
     if not isinstance(levels, list) or not levels:
         conn.commit()
         return 0
@@ -207,8 +209,8 @@ def replace_sleep_stages(conn, day: str, levels, start_local) -> int:
             continue
         stage = normalize_stage(item.get("activityLevel"), item.get("activityLevelName"))
         conn.execute(
-            "INSERT INTO sleep_stages(date, seq, stage, start_local, end_local, seconds) "
-            "VALUES(?,?,?,?,?,?)", (day, n, stage, start_local_iso, end_local_iso, secs))
+            "INSERT INTO sleep_stages(source, date, seq, stage, start_local, end_local, seconds) "
+            "VALUES(?,?,?,?,?,?,?)", ('garmin', day, n, stage, start_local_iso, end_local_iso, secs))
         n += 1
     conn.commit()
     return n
@@ -337,7 +339,7 @@ def write_series(conn, day: str, hrv_readings=None, stress_values=None, battery_
     return out
 
 
-def upsert_metrics(conn, day: str, metrics: dict) -> int:
+def upsert_metrics(conn, day: str, metrics: dict, source: str = "garmin") -> int:
     """metrics: {metric_name: (value, unit) | value}。"""
     n = 0
     for name, v in (metrics or {}).items():
@@ -350,10 +352,11 @@ def upsert_metrics(conn, day: str, metrics: dict) -> int:
         if not isinstance(value, (int, float)) or value != value:  # None / NaN
             continue
         conn.execute(
-            "INSERT INTO garmin_metrics(date, metric, value, unit, captured_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(date, metric) DO UPDATE SET value=excluded.value, unit=excluded.unit, "
-            "captured_at=excluded.captured_at",
-            (day, name, float(value), unit, _now()))
+            "INSERT INTO garmin_metrics(source, date, metric, value, unit, captured_at) "
+            "VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(source, date, metric) DO UPDATE SET value=excluded.value, "
+            "unit=excluded.unit, captured_at=excluded.captured_at",
+            (source, day, name, float(value), unit, _now()))
         n += 1
     conn.commit()
     return n
@@ -369,19 +372,23 @@ def upsert_garmin_activity(conn, aid, name, sport_key, start_local) -> None:
     conn.commit()
 
 
-def stats(conn) -> dict:
-    """给 get_sync_status / get_daily_brief 用的数据覆盖度摘要。"""
-    def one(sql):
-        return conn.execute(sql).fetchone()[0]
+def stats(conn, source: str = "garmin") -> dict:
+    """给 get_sync_status / get_daily_brief 用的数据覆盖度摘要（按源统计）。"""
+    def one(sql, args=()):
+        return conn.execute(sql, args).fetchone()[0]
     return {
-        "daily_metrics_days": one("SELECT COUNT(*) FROM daily_metrics"),
-        "sleep_stage_days": one("SELECT COUNT(DISTINCT date) FROM sleep_stages"),
+        "source": source,
+        "daily_metrics_days": one("SELECT COUNT(*) FROM daily_metrics WHERE source=?", (source,)),
+        "sleep_stage_days": one(
+            "SELECT COUNT(DISTINCT date) FROM sleep_stages WHERE source=?", (source,)),
         "sleep_series_days": one("SELECT COUNT(DISTINCT date) FROM sleep_series"),
         "hrv_reading_days": one("SELECT COUNT(DISTINCT date) FROM hrv_readings"),
         "stress_series_days": one("SELECT COUNT(DISTINCT date) FROM stress_series"),
         "battery_series_days": one("SELECT COUNT(DISTINCT date) FROM body_battery_series"),
-        "garmin_metric_days": one("SELECT COUNT(DISTINCT date) FROM garmin_metrics"),
-        "garmin_metric_names": one("SELECT COUNT(DISTINCT metric) FROM garmin_metrics"),
+        "garmin_metric_days": one(
+            "SELECT COUNT(DISTINCT date) FROM garmin_metrics WHERE source=?", (source,)),
+        "garmin_metric_names": one(
+            "SELECT COUNT(DISTINCT metric) FROM garmin_metrics WHERE source=?", (source,)),
         "activity_splits": one("SELECT COUNT(*) FROM activity_splits"),
         "activity_split_detail": one("SELECT COUNT(*) FROM activity_split_detail"),
         "activities_with_splits": one(

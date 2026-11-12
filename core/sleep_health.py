@@ -26,6 +26,11 @@ from __future__ import annotations
 import statistics
 from datetime import date, datetime, timedelta
 
+def _src(cfg: dict | None) -> str:
+    """当前生效的数据源；睡眠基线同样按源隔离。"""
+    from .db import active_source
+    return active_source(cfg)
+
 W_DEFAULT = {
     "duration": 0.25,
     "regularity": 0.25,
@@ -96,12 +101,13 @@ def _midpoint(day: str, start: str, end: str) -> float | None:
     return (mid - base).total_seconds() / 60.0
 
 
-def _recent_midpoints(conn, day: str, days: int = 28) -> list[float]:
+def _recent_midpoints(conn, day: str, days: int = 28, source: str = "garmin") -> list[float]:
     start = (date.fromisoformat(day) - timedelta(days=days)).isoformat()
     rows = conn.execute(
         "SELECT date, sleep_start, sleep_end FROM daily_metrics "
-        "WHERE date >= ? AND date <= ? AND sleep_start IS NOT NULL AND sleep_end IS NOT NULL "
-        "ORDER BY date", (start, day)).fetchall()
+        "WHERE source=? AND date >= ? AND date <= ? "
+        "AND sleep_start IS NOT NULL AND sleep_end IS NOT NULL "
+        "ORDER BY date", (source, start, day)).fetchall()
     out = []
     for r in rows:
         m = _midpoint(r["date"], r["sleep_start"], r["sleep_end"])
@@ -110,21 +116,21 @@ def _recent_midpoints(conn, day: str, days: int = 28) -> list[float]:
     return out
 
 
-def _recent_hours(conn, day: str, days: int = 28) -> list[float]:
+def _recent_hours(conn, day: str, days: int = 28, source: str = "garmin") -> list[float]:
     start = (date.fromisoformat(day) - timedelta(days=days)).isoformat()
     rows = conn.execute(
-        "SELECT sleep_hours FROM daily_metrics WHERE date >= ? AND date <= ? "
-        "AND sleep_hours IS NOT NULL ORDER BY date", (start, day)).fetchall()
+        "SELECT sleep_hours FROM daily_metrics WHERE source=? AND date >= ? AND date <= ? "
+        "AND sleep_hours IS NOT NULL ORDER BY date", (source, start, day)).fetchall()
     return [float(r["sleep_hours"]) for r in rows]
 
 
 # ── 睡眠阶段 → 片段/时段 ─────────────────────────────────────
 
-def _stage_rows(conn, day: str) -> list:
+def _stage_rows(conn, day: str, source: str = "garmin") -> list:
     try:
         return conn.execute(
             "SELECT stage, start_local, end_local, seconds FROM sleep_stages "
-            "WHERE date=? ORDER BY seq", (day,)).fetchall()
+            "WHERE source=? AND date=? ORDER BY seq", (source, day)).fetchall()
     except Exception:  # noqa: BLE001
         return []
 
@@ -148,15 +154,15 @@ def _asleep_epochs(rows) -> set[int]:
     return epochs
 
 
-def sleep_regularity_index(conn, day: str) -> float | None:
+def sleep_regularity_index(conn, day: str, source: str = "garmin") -> float | None:
     """SRI：相邻两天在同一时刻的睡眠状态一致比例。
 
     每 5 分钟一个 epoch，一致记 +1、不一致记 −1，均值映射到 0–100
     （随机约 50，完全一致 100；文献中健康成人中位数约 80）。
     """
-    cur = _asleep_epochs(_stage_rows(conn, day))
+    cur = _asleep_epochs(_stage_rows(conn, day, source))
     prev_day = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
-    prev = _asleep_epochs(_stage_rows(conn, prev_day))
+    prev = _asleep_epochs(_stage_rows(conn, prev_day, source))
     if not cur or not prev:
         return None
     agree = sum(1 for i in range(EPOCHS_PER_DAY) if (i in cur) == (i in prev))
@@ -234,15 +240,17 @@ def score_subjective(sleep_feel) -> float | None:
 
 # ── 主入口 ─────────────────────────────────────────────────
 
-def evaluate(conn, cfg: dict, day: str, sleep_feel=None) -> dict:
+def evaluate(conn, cfg: dict, day: str, sleep_feel=None, source: str | None = None) -> dict:
     """计算某天的睡眠状态分。缺数据时返回 score=None，并说明缺哪一维。"""
     s_cfg = cfg.get("sleep") or {}
     weights = {**W_DEFAULT, **(s_cfg.get("weights") or {})}
     need_h, need_source = personal_need_h(conn, cfg)
 
+    src = source or _src(cfg)
     dm = conn.execute(
         "SELECT sleep_hours, sleep_deep_h, sleep_light_h, sleep_rem_h, sleep_awake_h, "
-        "sleep_start, sleep_end FROM daily_metrics WHERE date=?", (day,)).fetchone()
+        "sleep_start, sleep_end FROM daily_metrics WHERE source=? AND date=?",
+        (src, day)).fetchone()
     if dm is None:
         return {"date": day, "score": None, "confidence": "low", "dimensions": {},
                 "personal_need_h": need_h, "need_source": need_source,
@@ -253,9 +261,9 @@ def evaluate(conn, cfg: dict, day: str, sleep_feel=None) -> dict:
     bed_h = (hours + awake_h) if hours is not None else None
     eff = round(hours / bed_h * 100, 1) if hours and bed_h and bed_h > 0 else None
 
-    rows = _stage_rows(conn, day)
-    sri = sleep_regularity_index(conn, day)
-    mids = _recent_midpoints(conn, day, int(s_cfg.get("baseline_days", 28) or 28))
+    rows = _stage_rows(conn, day, src)
+    sri = sleep_regularity_index(conn, day, src)
+    mids = _recent_midpoints(conn, day, int(s_cfg.get("baseline_days", 28) or 28), src)
     mid_dev_h = None
     mid_sd_h = None
     if len(mids) >= 5:
@@ -266,7 +274,7 @@ def evaluate(conn, cfg: dict, day: str, sleep_feel=None) -> dict:
             mid_dev_h = round((today_mid - med) / 60.0, 2)
 
     # 7 天睡眠债（相对个人需要量）
-    h7 = _recent_hours(conn, day, 7)
+    h7 = _recent_hours(conn, day, 7, src)
     debt_7d = round(max(0.0, need_h * len(h7) - sum(h7)), 2) if h7 else None
 
     waso_raw = _num(dm["sleep_awake_h"])
@@ -332,15 +340,16 @@ def evaluate(conn, cfg: dict, day: str, sleep_feel=None) -> dict:
     }
 
 
-def percentile(conn, day: str, score: float | None, days: int = 28) -> float | None:
+def percentile(conn, day: str, score: float | None, days: int = 28,
+               source: str = "garmin") -> float | None:
     """今天的睡眠分在过去 N 天里的百分位（越低越差）。"""
     if score is None:
         return None
     start = (date.fromisoformat(day) - timedelta(days=days)).isoformat()
     try:
         vals = [r[0] for r in conn.execute(
-            "SELECT value FROM garmin_metrics WHERE metric='sleep_state_score' "
-            "AND date >= ? AND date < ? ORDER BY date", (start, day)).fetchall()]
+            "SELECT value FROM garmin_metrics WHERE source=? AND metric='sleep_state_score' "
+            "AND date >= ? AND date < ? ORDER BY date", (source, start, day)).fetchall()]
     except Exception:  # noqa: BLE001
         return None
     if len(vals) < 7:
@@ -358,7 +367,8 @@ def _quantile(vals, p):
     return vs[f] + (vs[c] - vs[f]) * (k - f)
 
 
-def g8_status(conn, cfg: dict, day: str, score: float | None) -> dict:
+def g8_status(conn, cfg: dict, day: str, score: float | None,
+              source: str | None = None) -> dict:
     """G8（睡眠预测项）的观察/拦截状态。
 
     触发条件：score < min(个人 28 天 p10, 绝对下限 60)。
@@ -374,11 +384,12 @@ def g8_status(conn, cfg: dict, day: str, score: float | None) -> dict:
     min_days = int(s_cfg.get("g8_p10_min_days") or 7)
     use_p10 = bool(s_cfg.get("g8_use_personal_p10", True))
 
+    src = source or _src(cfg)
     start = (date.fromisoformat(day) - timedelta(days=window)).isoformat()
     try:
         hist = [r[0] for r in conn.execute(
-            "SELECT value FROM garmin_metrics WHERE metric='sleep_state_score' "
-            "AND date >= ? AND date < ? ORDER BY date", (start, day)).fetchall()]
+            "SELECT value FROM garmin_metrics WHERE source=? AND metric='sleep_state_score' "
+            "AND date >= ? AND date < ? ORDER BY date", (src, start, day)).fetchall()]
     except Exception:  # noqa: BLE001
         hist = []
     p10 = _quantile(hist, 0.10) if (use_p10 and len(hist) >= min_days) else None

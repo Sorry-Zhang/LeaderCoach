@@ -48,6 +48,10 @@ active INTEGER DEFAULT 1, created_at TEXT);
 
 CREATE TABLE activities (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
+-- source: 数据来源（garmin / coros / manual）。不同设备同一运动不合并，
+-- 由 (source, external_id) 唯一键区分；garmin_activity_id 只给 Garmin 用。
+source TEXT NOT NULL DEFAULT 'garmin',
+external_id TEXT,
 garmin_activity_id TEXT UNIQUE,
 fit_path TEXT,
 start_time TEXT NOT NULL,
@@ -79,6 +83,7 @@ mismatch_flag TEXT,
 calc_version TEXT, param_version TEXT,
 created_at TEXT, updated_at TEXT);
 
+CREATE UNIQUE INDEX idx_act_source_ext ON activities(source, external_id);
 CREATE INDEX idx_act_date ON activities(start_time);
 CREATE INDEX idx_act_sport ON activities(sport_id, start_time);
 
@@ -89,14 +94,18 @@ pace_min_km REAL, avg_hr INTEGER, elevation_gain_m REAL,
 PRIMARY KEY (activity_id, km));
 
 CREATE TABLE daily_metrics (
-date TEXT PRIMARY KEY,
+-- 主键含 source：Garmin 的 HRV 是夜间平均、COROS 是 RMSSD 均值，
+-- 混进同一条基线会让 G4/G5 误触发。同一日期两源各存一行。
+source TEXT NOT NULL DEFAULT 'garmin',
+date TEXT NOT NULL,
 sleep_hours REAL, sleep_deep_h REAL, sleep_light_h REAL,
 sleep_rem_h REAL, sleep_awake_h REAL,
 sleep_start TEXT, sleep_end TEXT, sleep_mid TEXT,
 hrv_last_night REAL, hrv_baseline REAL, hrv_dev_pct REAL,
 resting_hr INTEGER, rhr_baseline REAL,
 stress_daily_avg REAL,
-data_status TEXT DEFAULT 'ok' CHECK (data_status IN ('ok','partial','missing')));
+data_status TEXT DEFAULT 'ok' CHECK (data_status IN ('ok','partial','missing')),
+PRIMARY KEY (source, date));
 
 CREATE TABLE official_snapshot (
 date TEXT PRIMARY KEY,
@@ -191,14 +200,16 @@ status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','active','archive
 created_at TEXT, activated_at TEXT);
 
 CREATE TABLE engine_daily (
-date TEXT PRIMARY KEY,
+source TEXT NOT NULL DEFAULT 'garmin',
+date TEXT NOT NULL,
 ctl REAL, atl REAL, tsb REAL,
 acwr REAL, ewma7 REAL, ewma28 REAL,
 readiness_score REAL,
 readiness_confidence TEXT CHECK (readiness_confidence IN ('high','medium','low')),
 pillars TEXT, inputs_used TEXT,
 gates_triggered TEXT, flags TEXT,
-param_version TEXT, calc_version TEXT);
+param_version TEXT, calc_version TEXT,
+PRIMARY KEY (source, date));
 
 -- ═══ G 治理 ═══
 

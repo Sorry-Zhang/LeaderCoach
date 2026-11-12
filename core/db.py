@@ -25,10 +25,129 @@ def get_conn(cfg: dict) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    # 先迁数据源隔离（不依赖 store_ext 建表：老库的同名表要先重建主键）
+    _migrate_source_dimension(conn)
     # v1.8 扩展表（只建新表，不改 v1.7 DDL）
     from . import store_ext
     store_ext.ensure(conn)
     return conn
+
+
+# ── v1.15：数据源隔离 ──────────────────────────────────────
+
+# 每张表需要带 source 维度；PK 改成 (source, ...) 只能靠重建表。
+# sleep_series 不在其中：它是 Garmin SDK 直读的分钟级序列，COROS 官方接口
+# 只给睡眠阶段百分比、没有分钟序列，它只可能有一个生产者。
+_SOURCE_TABLES = (
+    # (表名, 重建 DDL, 需要复制的列)
+    ("daily_metrics",
+     """CREATE TABLE daily_metrics__m (
+     source TEXT NOT NULL DEFAULT 'garmin', date TEXT NOT NULL,
+     sleep_hours REAL, sleep_deep_h REAL, sleep_light_h REAL,
+     sleep_rem_h REAL, sleep_awake_h REAL,
+     sleep_start TEXT, sleep_end TEXT, sleep_mid TEXT,
+     hrv_last_night REAL, hrv_baseline REAL, hrv_dev_pct REAL,
+     resting_hr INTEGER, rhr_baseline REAL,
+     stress_daily_avg REAL,
+     data_status TEXT DEFAULT 'ok' CHECK (data_status IN ('ok','partial','missing')),
+     PRIMARY KEY (source, date))""",
+     ("date", "sleep_hours", "sleep_deep_h", "sleep_light_h", "sleep_rem_h",
+      "sleep_awake_h", "sleep_start", "sleep_end", "sleep_mid",
+      "hrv_last_night", "hrv_baseline", "hrv_dev_pct", "resting_hr",
+      "rhr_baseline", "stress_daily_avg", "data_status")),
+    ("engine_daily",
+     """CREATE TABLE engine_daily__m (
+     source TEXT NOT NULL DEFAULT 'garmin', date TEXT NOT NULL,
+     ctl REAL, atl REAL, tsb REAL,
+     acwr REAL, ewma7 REAL, ewma28 REAL,
+     readiness_score REAL,
+     readiness_confidence TEXT CHECK (readiness_confidence IN ('high','medium','low')),
+     pillars TEXT, inputs_used TEXT,
+     gates_triggered TEXT, flags TEXT,
+     param_version TEXT, calc_version TEXT,
+     PRIMARY KEY (source, date))""",
+     ("date", "ctl", "atl", "tsb", "acwr", "ewma7", "ewma28", "readiness_score",
+      "readiness_confidence", "pillars", "inputs_used", "gates_triggered", "flags",
+      "param_version", "calc_version")),
+    ("sleep_stages",
+     """CREATE TABLE sleep_stages__m (
+     source TEXT NOT NULL DEFAULT 'garmin', date TEXT NOT NULL, seq INTEGER NOT NULL,
+     stage TEXT NOT NULL, start_local TEXT, end_local TEXT, seconds INTEGER NOT NULL,
+     PRIMARY KEY (source, date, seq))""",
+     ("date", "seq", "stage", "start_local", "end_local", "seconds")),
+    ("garmin_metrics",
+     """CREATE TABLE garmin_metrics__m (
+     source TEXT NOT NULL DEFAULT 'garmin', date TEXT NOT NULL, metric TEXT NOT NULL,
+     value REAL, unit TEXT, captured_at TEXT,
+     PRIMARY KEY (source, date, metric))""",
+     ("date", "metric", "value", "unit", "captured_at")),
+)
+
+
+def _table_exists(conn, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _migrate_source_dimension(conn) -> bool:
+    """幂等：给数据表加上 source 维度，现有行归为 garmin。
+
+    返回 True 说明本次真的动了结构。整个迁移在一个事务里，失败全部回滚。
+    调用方是 get_conn，因此新库（已在 DDL 里带 source）会直接跳过。
+    """
+    if not _table_exists(conn, "activities") and not any(
+            _table_exists(conn, name) for name, _, _ in _SOURCE_TABLES):
+        return False  # 全新库，由 schema.sql / store_ext 直接建带 source 的表
+
+    done = False
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # activities：加列即可，主键 id 不变（activity_split_detail 靠它外键）
+        if _table_exists(conn, "activities"):
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(activities)")}
+            added = False
+            if "source" not in cols:
+                conn.execute("ALTER TABLE activities ADD COLUMN source TEXT NOT NULL "
+                             "DEFAULT 'garmin'")
+                added = True
+            if "external_id" not in cols:
+                conn.execute("ALTER TABLE activities ADD COLUMN external_id TEXT")
+                added = True
+            if added:
+                # Garmin 家的 external_id 就是它自己的 activityId
+                conn.execute("UPDATE activities SET external_id = garmin_activity_id "
+                             "WHERE external_id IS NULL AND garmin_activity_id IS NOT NULL")
+                done = True
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_act_source_ext "
+                         "ON activities(source, external_id)")
+
+        for name, ddl, cols in _SOURCE_TABLES:
+            if not _table_exists(conn, name):
+                continue
+            have = {r[1] for r in conn.execute(f"PRAGMA table_info({name})")}
+            if "source" in have:
+                continue
+            col_list = ", ".join(cols)
+            marks = ", ".join("?" for _ in cols)
+            rows = [tuple(r) for r in conn.execute(f"SELECT {col_list} FROM {name}")]
+            conn.execute(ddl)
+            conn.executemany(
+                f"INSERT INTO {name}__m(source, {col_list}) VALUES('garmin', {marks})", rows)
+            conn.execute(f"DROP TABLE {name}")
+            conn.execute(f"ALTER TABLE {name}__m RENAME TO {name}")
+            done = True
+
+        conn.commit()
+        return done
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def active_source(cfg: dict | None = None) -> str:
+    """当前生效的数据源。显式配置，不从数据推断（两台设备同戴会一天一个口径）。"""
+    src = ((cfg or {}).get("source") or {}).get("active") or "garmin"
+    return str(src).strip().lower()
 
 def _split_statements(script: str) -> list[str]:
     script = script.replace("\r\n", "\n")

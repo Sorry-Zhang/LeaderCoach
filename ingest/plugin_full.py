@@ -327,16 +327,18 @@ def _upsert_daily(conn, day: str, values: dict) -> None:
     row = {k: values.get(k) for k in cols if values.get(k) is not None}
     if not row:
         return
-    existing = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (day,)).fetchone()
+    existing = conn.execute(
+        "SELECT * FROM daily_metrics WHERE source='garmin' AND date=?", (day,)).fetchone()
     merged = {k: existing[k] for k in existing.keys()} if existing else {}
-    merged.pop("date", None)
+    for drop in ("source", "date"):
+        merged.pop(drop, None)
     merged.update(row)
     keys = list(merged)
     conn.execute(
-        f"INSERT INTO daily_metrics(date,{','.join(keys)}) "
-        f"VALUES({','.join('?' for _ in range(len(keys) + 1))}) "
-        "ON CONFLICT(date) DO UPDATE SET " + ",".join(f"{k}=excluded.{k}" for k in keys),
-        [day] + [merged[k] for k in keys])
+        f"INSERT INTO daily_metrics(source,date,{','.join(keys)}) "
+        f"VALUES({','.join('?' for _ in range(len(keys) + 2))}) "
+        "ON CONFLICT(source,date) DO UPDATE SET " + ",".join(f"{k}=excluded.{k}" for k in keys),
+        ['garmin', day] + [merged[k] for k in keys])
 
 
 def _extract_activity(act: dict) -> dict:
@@ -435,13 +437,15 @@ def _insert_activity_base(conn, a: dict, sport: str) -> None:
     from core.engine import intensity_domain
     domain = intensity_domain(hr_zones_pct=a["hr_zones_pct"])
     conn.execute(
-        "INSERT INTO activities(garmin_activity_id, start_time, sport_id, duration_min, distance_km, "
+        "INSERT INTO activities(source, garmin_activity_id, external_id, start_time, sport_id, "
+        "duration_min, distance_km, "
         "avg_hr, max_hr, hr_zones_pct, avg_pace_min_km, elevation_gain_m, power_avg_w, power_max_w, "
         "dynamics, te_aerobic, te_anaerobic, official_load, indoor, intensity_domain, "
         "calc_version, param_version, created_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "VALUES('garmin',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(garmin_activity_id) DO NOTHING",
-        (a["garmin_activity_id"], a["start_time"], sport, a["duration_min"], a["distance_km"],
+        (a["garmin_activity_id"], a["garmin_activity_id"],
+         a["start_time"], sport, a["duration_min"], a["distance_km"],
          a["avg_hr"], a["max_hr"],
          json.dumps(a["hr_zones_pct"]) if a["hr_zones_pct"] else None,
          a["avg_pace_min_km"], a["elevation_gain_m"], a["power_avg_w"], a["power_max_w"],
@@ -804,7 +808,8 @@ def run(start: str | None, end: str | None, activities: int, download_fit: bool,
 
     conn = dbmod.get_conn(cfg)
     try:
-        report["metric_rows"] = conn.execute("SELECT COUNT(*) FROM garmin_metrics").fetchone()[0]
+        report["metric_rows"] = conn.execute(
+            "SELECT COUNT(*) FROM garmin_metrics WHERE source='garmin'").fetchone()[0]
         report["activities"] = len(acts)
         report["inserted"] = _upsert_activities(conn, cfg, acts)
     finally:

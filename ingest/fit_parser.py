@@ -260,8 +260,10 @@ def _find_activity(conn, fit_file, info: dict):
     if not st:
         return None
     day = st[:10]
+    # 只和 Garmin 自己的活动对齐：库里可能同时有 COROS 的同一天活动，
+    # 不加 source 条件会把 FIT 分段挂到别的设备记录上。
     sql = ("SELECT id, start_time, duration_min, distance_km FROM activities "
-           "WHERE substr(start_time,1,10)=?")
+           "WHERE source='garmin' AND substr(start_time,1,10)=?")
     cands = conn.execute(sql, (day,)).fetchall()
     if not cands:
         # 跨日：开始时刻接近零点时，FIT 本地日期可能比活动早/晚一天

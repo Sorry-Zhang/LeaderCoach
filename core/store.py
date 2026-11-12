@@ -43,7 +43,7 @@ def insert_activity(conn, cfg: dict, act: dict) -> int:
 
     gid = act.get("garmin_activity_id") or act.get("fit_path") or f"manual:{day}:{sport_id}"
     params = (
-        gid, act.get("fit_path"), start, sport_id, duration,
+        gid, gid, act.get("fit_path"), start, sport_id, duration,
         act.get("distance_km"), act.get("avg_hr"), act.get("max_hr"),
         json.dumps(act.get("hr_zones_pct")) if act.get("hr_zones_pct") else None,
         act.get("avg_pace_min_km"), act.get("elevation_gain_m"),
@@ -55,12 +55,13 @@ def insert_activity(conn, cfg: dict, act: dict) -> int:
         "1.3", cfg["_root"] and "p2026-10", _now(),
     )
     conn.execute(
-        "INSERT INTO activities(garmin_activity_id, fit_path, start_time, sport_id, duration_min, "
+        "INSERT INTO activities(source, garmin_activity_id, external_id, fit_path, start_time, "
+        "sport_id, duration_min, "
         "distance_km, avg_hr, max_hr, hr_zones_pct, avg_pace_min_km, elevation_gain_m, "
         "power_avg_w, power_max_w, dynamics, indoor, annotation, "
         "rpe, srpe_au, hr_trimp, load_final, load_path_used, intensity_domain, mismatch_flag, "
         "calc_version, param_version, created_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "VALUES('garmin',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(garmin_activity_id) DO UPDATE SET "
         "start_time=excluded.start_time, sport_id=excluded.sport_id, duration_min=excluded.duration_min, "
         "distance_km=excluded.distance_km, avg_hr=excluded.avg_hr, max_hr=excluded.max_hr, "
@@ -83,7 +84,7 @@ def insert_activity(conn, cfg: dict, act: dict) -> int:
     return row["id"]
 
 def resolve_rpe_target(conn, day: str, sport_id: str,
-                       activity_id=None) -> dict:
+                       activity_id=None, cfg: dict | None = None) -> dict:
     """定位 RPE 要写到哪条活动。
 
     同一天同一运动类型可能有多条（早课/下午课/晚课），仅凭「日期+运动类型」
@@ -104,9 +105,11 @@ def resolve_rpe_target(conn, day: str, sport_id: str,
                 f"活动 id={key} 的日期是 {row['start_time'][:10]}，与传入 date={day} 不一致")
         return dict(row)
 
+    # 只匹配当前数据源：两个源同一天同运动时不能互相顶替
     rows = [dict(r) for r in conn.execute(
-        "SELECT * FROM activities WHERE substr(start_time,1,10)=? AND sport_id=? "
-        "ORDER BY start_time", (day, sport_id)).fetchall()]
+        "SELECT * FROM activities WHERE source=? AND substr(start_time,1,10)=? "
+        "AND sport_id=? ORDER BY start_time",
+        (dbmod.active_source(cfg), day, sport_id)).fetchall()]
     if not rows:
         raise LookupError(f"{day} 没有 {sport_id} 的活动，无法录入 RPE")
     if len(rows) > 1:
@@ -122,7 +125,7 @@ def resolve_rpe_target(conn, day: str, sport_id: str,
 def log_activity_rpe(conn, cfg: dict, day: str, sport_id: str, rpe: int,
                      activity_id=None, overwrite: bool = False) -> dict:
     """写入单次活动的 RPE。返回被命中的活动信息（便于调用方核对）。"""
-    act_row = resolve_rpe_target(conn, day, sport_id, activity_id)
+    act_row = resolve_rpe_target(conn, day, sport_id, activity_id, cfg)
     if act_row["rpe"] is not None and not overwrite:
         raise ValueError(
             f"活动 id={act_row['id']}（{act_row['start_time'][:16]}，"

@@ -161,19 +161,20 @@ def write_health_rows(conn, rows) -> int:
         if all(row.get(k) is None for k in _METRIC_COLS):
             continue
         merged = {}
-        existing = conn.execute("SELECT * FROM daily_metrics WHERE date=?", (d,)).fetchone()
+        existing = conn.execute(
+            "SELECT * FROM daily_metrics WHERE source='garmin' AND date=?", (d,)).fetchone()
         if existing:
-            merged = {k: existing[k] for k in existing.keys()}
+            merged = {k: existing[k] for k in existing.keys() if k != "source"}
         for k in _METRIC_COLS:
             if row.get(k) is not None:
                 merged[k] = row[k]
             elif k not in merged:
                 merged[k] = None
         conn.execute(
-            "INSERT INTO daily_metrics(date, sleep_hours, sleep_deep_h, sleep_light_h, "
+            "INSERT INTO daily_metrics(source, date, sleep_hours, sleep_deep_h, sleep_light_h, "
             "sleep_rem_h, sleep_awake_h, hrv_last_night, hrv_baseline, resting_hr, "
-            "stress_daily_avg) VALUES(?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(date) DO UPDATE SET "
+            "stress_daily_avg) VALUES('garmin',?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(source, date) DO UPDATE SET "
             "sleep_hours=excluded.sleep_hours, sleep_deep_h=excluded.sleep_deep_h, "
             "sleep_light_h=excluded.sleep_light_h, sleep_rem_h=excluded.sleep_rem_h, "
             "sleep_awake_h=excluded.sleep_awake_h, hrv_last_night=excluded.hrv_last_night, "
