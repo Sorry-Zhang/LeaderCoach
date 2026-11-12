@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import sqlite3
@@ -320,3 +322,47 @@ def test_stats_scoped_by_source():
             conn.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── 启动健壮性 ─────────────────────────────────────────────
+
+def _run_coros(argv, cwd):
+    """在指定 cwd 下跑 coros_mcp/main.py，返回 (rc, stderr)。"""
+    import subprocess
+    exe = str(ROOT / ".venv" / "Scripts" / "python.exe")
+    if not Path(exe).exists():
+        exe = sys.executable
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+    r = subprocess.run([exe, str(ROOT / "coros_mcp" / "main.py"), *argv],
+                       stdin=subprocess.DEVNULL, capture_output=True,
+                       cwd=str(cwd), env=env, timeout=60)
+    return r.returncode, r.stderr.decode("utf-8", "replace")
+
+
+def test_serve_is_default_command():
+    """漏写 serve 不能直接退出：客户端只会看到 Connection closed，极难定位。
+    用 argparse 层验证：不给子命令时应当落到 serve，而不是报缺参数。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "coros_main", ROOT / "coros_mcp" / "main.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    seen = {}
+    mod.cmd_serve = lambda args: seen.setdefault("cmd", "serve") or 0
+    with contextlib.redirect_stdout(io.StringIO()):
+        mod.main([])
+    assert seen.get("cmd") == "serve", "不给子命令时没有默认到 serve"
+
+    seen.clear()
+    mod.main(["serve"])
+    assert seen.get("cmd") == "serve"
+
+
+def test_doctor_runs_from_foreign_cwd():
+    """doctor 必须在任意 cwd 下可用（MCP 客户端的工作目录不是项目目录）。"""
+    rc, err = _run_coros(["doctor"], tempfile.gettempdir())
+    # 未授权/未连通时返回 1 也算正常；关键是不能是 import/路径错误
+    assert "ModuleNotFoundError" not in err, err[:400]
+    assert "No such file" not in err, err[:400]
