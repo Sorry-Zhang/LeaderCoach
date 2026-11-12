@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .config import resolve
 
-SCHEMA_VERSION = "1.7"
+SCHEMA_VERSION = "1.8"
 ENGINE_VERSION = "1.3"
 PARAM_VERSION = "p2026-10"
 
@@ -109,6 +109,26 @@ def _source_migration_plan(conn) -> tuple[bool, list[str]]:
     return acts_add, rebuild
 
 
+def _stamp_version_if_stale(conn) -> bool:
+    """结构已是新版、但版本号还落后时补上版本戳。
+
+    用于修两种情况：迁移中途崩溃导致号没写上；或旧代码迁移完但没改常量。
+    只读探测确认结构就绪才动库，不抢写锁。
+    """
+    if not _table_exists(conn, "meta"):
+        return False
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row is None or row[0] == SCHEMA_VERSION:
+        return False
+    acts_add, rebuild = _source_migration_plan(conn)
+    if acts_add or rebuild:
+        return False  # 结构还不完整，交给迁移
+    conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,))
+    conn.commit()
+    return True
+
+
 def _migrate_source_dimension(conn) -> bool:
     """幂等：给数据表加上 source 维度，现有行归为 garmin。
 
@@ -117,6 +137,7 @@ def _migrate_source_dimension(conn) -> bool:
     """
     acts_add, rebuild = _source_migration_plan(conn)
     if not acts_add and not rebuild:
+        _stamp_version_if_stale(conn)
         return False  # 已迁移（或全新库），不碰写锁
 
     conn.execute("BEGIN IMMEDIATE")
@@ -141,8 +162,15 @@ def _migrate_source_dimension(conn) -> bool:
         for name, ddl, cols in _SOURCE_TABLES:
             if name not in rebuild:
                 continue
-            col_list = ", ".join(cols)
-            marks = ", ".join("?" for _ in cols)
+            # 只复制两表都有的列：从更老的版本升上来时个别列可能还不存在，
+            # 直接 SELECT 全列会 OperationalError 把整个迁移带崩。
+            have_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({name})")}
+            if "date" not in have_cols:
+                raise RuntimeError(
+                    f"{name} 缺少 date 列，无法迁移，请先备份后人工处理")
+            use_cols = [c for c in cols if c in have_cols]
+            col_list = ", ".join(use_cols)
+            marks = ", ".join("?" for _ in use_cols)
             rows = [tuple(r) for r in conn.execute(f"SELECT {col_list} FROM {name}")]
             conn.execute(ddl)
             conn.executemany(
@@ -151,6 +179,13 @@ def _migrate_source_dimension(conn) -> bool:
             conn.execute(f"ALTER TABLE {name}__m RENAME TO {name}")
 
         conn.commit()
+        # 结构真的变了才把版本号跟上：老库（1.7）升到 1.8 后，
+        # check_version / verify 的读数才不会继续显示旧号。
+        if (acts_add or rebuild) and _table_exists(conn, "meta"):
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES('schema_version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
+            conn.commit()
         return bool(acts_add or rebuild)
     except BaseException:
         conn.rollback()

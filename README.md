@@ -3,8 +3,11 @@
 [![中文](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-current-red)](README.md)
 [![English](https://img.shields.io/badge/English-switch-blue)](README.en.md)
 
-本地优先的多运动训练引擎：把 Garmin 数据读入本地数据库，用确定性代码计算负荷、
+本地优先的多运动训练引擎：把可穿戴设备的数据读入本地数据库，用确定性代码计算负荷、
 恢复状态与当天的训练预测，再给出当天的训练安排。LLM 只做调整与解释，不参与运行时计算。
+
+数据源按 `source` 隔离（不同设备的 HRV / 静息心率定义不同，基线不能混算），
+目前接入 Garmin（`garmin-coach`）与 COROS（`coros-coach`），两者共用同一个库与同一套 `core/`。
 
 > 术语说明：代码与文档里的 **训练预测**（`training_forecast`，编号 G1–G10）指"今天可能
 > 需要调整的情况"，不是安全审查；**主观记录**（`logging`）指每日主观状态与补录节奏；
@@ -311,6 +314,10 @@ tests/      引擎与 schema 测试
 
 ## 更新
 
+- 2026-11-12（v1.16）：`SCHEMA_VERSION` 升至 **1.8**。上一版改了 DDL（四张表主键加
+  `source`）却没跟着升号，会让 `verify` / `check_version` 显示旧值而误导排查；
+  现在迁移完成时会自动补上版本戳，且迁移只复制两表都有的列，从更老版本升上来
+  不会因缺列而崩。删除早期探针脚本 `scripts/coros_import.py`（已被 `coros_mcp/` 取代）。
 - 2026-11-12（v1.15）：新增 `coros-coach`——独立的 COROS MCP，与 `garmin-coach`
   并列。数据进同一个库、分析用同一套 `core/`，靠新增的 `source` 维度隔离：
   `activities` 加 `source`/`external_id` 并以 `(source, external_id)` 做唯一键，

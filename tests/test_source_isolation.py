@@ -366,3 +366,44 @@ def test_doctor_runs_from_foreign_cwd():
     # 未授权/未连通时返回 1 也算正常；关键是不能是 import/路径错误
     assert "ModuleNotFoundError" not in err, err[:400]
     assert "No such file" not in err, err[:400]
+
+
+def test_schema_version_bumps_after_migration():
+    """结构迁移完成后版本号必须跟上，否则 verify/check_version 会显示旧号，
+    排查时会被误导（实测曾出现 DDL 改了但常量停在 1.7）。"""
+    tmp = Path(tempfile.mkdtemp(prefix="coach_ver_"))
+    try:
+        cfg = _fresh_cfg(tmp)
+        conn = dbmod.get_conn(cfg)
+        try:
+            # 全新库直接就是当前版本
+            v = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+            assert v == dbmod.SCHEMA_VERSION
+        finally:
+            conn.close()
+
+        # 把库退回「旧结构 + 旧版本号」的姿态，再打开应自动升级
+        conn = sqlite3.connect(str(tmp / "db" / "coach.db"))
+        conn.executescript("""
+            DROP TABLE IF EXISTS daily_metrics;
+            CREATE TABLE daily_metrics (date TEXT PRIMARY KEY,
+              sleep_hours REAL, hrv_last_night REAL, resting_hr INTEGER);
+            INSERT INTO daily_metrics(date, sleep_hours) VALUES('2026-01-01', 7.0);
+            UPDATE meta SET value='1.7' WHERE key='schema_version';
+        """)
+        conn.commit()
+        conn.close()
+
+        conn = dbmod.get_conn(cfg)  # 触发迁移 + 补版本号
+        try:
+            v = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+            assert v == dbmod.SCHEMA_VERSION, f"迁移后版本仍是 {v}"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM daily_metrics").fetchone()[0] == 1
+        finally:
+            conn.close()
+        assert dbmod.check_version(cfg) is None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
