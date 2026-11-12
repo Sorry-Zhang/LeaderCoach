@@ -373,25 +373,47 @@ def upsert_garmin_activity(conn, aid, name, sport_key, start_local) -> None:
 
 
 def stats(conn, source: str = "garmin") -> dict:
-    """给 get_sync_status / get_daily_brief 用的数据覆盖度摘要（按源统计）。"""
+    """给 get_sync_status / get_daily_brief 用的数据覆盖度摘要（按源统计）。
+
+    注意两类表：
+      - 带 source 的（daily_metrics / sleep_stages / garmin_metrics）：直接按源数
+      - 不带 source 的（sleep_series / hrv_readings / stress_series /
+        body_battery_series / plugin_raw）：这些只有一个生产者（Garmin SDK 直读），
+        COROS 官方接口不提供分钟级序列。查询非 garmin 源时返回 None，
+        避免把 Garmin 的 158 天睡眠序列当成 COROS 的数据。
+    """
+    is_garmin = source == "garmin"
+
     def one(sql, args=()):
         return conn.execute(sql, args).fetchone()[0]
+
+    def garmin_only(sql):
+        return one(sql) if is_garmin else None
+
     return {
         "source": source,
+        "scope_note": ("带源隔离的指标只算当前源；sleep_series / hrv_readings / "
+                       "stress_series / body_battery_series / plugin_raw 仅 Garmin 有，"
+                       "非 garmin 源返回 null" if not is_garmin else None),
         "daily_metrics_days": one("SELECT COUNT(*) FROM daily_metrics WHERE source=?", (source,)),
         "sleep_stage_days": one(
             "SELECT COUNT(DISTINCT date) FROM sleep_stages WHERE source=?", (source,)),
-        "sleep_series_days": one("SELECT COUNT(DISTINCT date) FROM sleep_series"),
-        "hrv_reading_days": one("SELECT COUNT(DISTINCT date) FROM hrv_readings"),
-        "stress_series_days": one("SELECT COUNT(DISTINCT date) FROM stress_series"),
-        "battery_series_days": one("SELECT COUNT(DISTINCT date) FROM body_battery_series"),
+        "sleep_series_days": garmin_only("SELECT COUNT(DISTINCT date) FROM sleep_series"),
+        "hrv_reading_days": garmin_only("SELECT COUNT(DISTINCT date) FROM hrv_readings"),
+        "stress_series_days": garmin_only("SELECT COUNT(DISTINCT date) FROM stress_series"),
+        "battery_series_days": garmin_only("SELECT COUNT(DISTINCT date) FROM body_battery_series"),
         "garmin_metric_days": one(
             "SELECT COUNT(DISTINCT date) FROM garmin_metrics WHERE source=?", (source,)),
         "garmin_metric_names": one(
             "SELECT COUNT(DISTINCT metric) FROM garmin_metrics WHERE source=?", (source,)),
-        "activity_splits": one("SELECT COUNT(*) FROM activity_splits"),
-        "activity_split_detail": one("SELECT COUNT(*) FROM activity_split_detail"),
+        "activity_splits": one(
+            "SELECT COUNT(*) FROM activity_splits s JOIN activities a ON a.id=s.activity_id "
+            "WHERE a.source=?", (source,)),
+        "activity_split_detail": one(
+            "SELECT COUNT(*) FROM activity_split_detail d "
+            "JOIN activities a ON a.id=d.activity_id WHERE a.source=?", (source,)),
         "activities_with_splits": one(
-            "SELECT COUNT(DISTINCT activity_id) FROM activity_split_detail"),
-        "raw_payloads": one("SELECT COUNT(*) FROM plugin_raw"),
+            "SELECT COUNT(DISTINCT d.activity_id) FROM activity_split_detail d "
+            "JOIN activities a ON a.id=d.activity_id WHERE a.source=?", (source,)),
+        "raw_payloads": garmin_only("SELECT COUNT(*) FROM plugin_raw"),
     }

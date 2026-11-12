@@ -41,7 +41,27 @@ MCP 的能力和使用范围会根据后续版本的需求不断完善、更新�
 - 活动：Garmin FIT / CSV；
 - 每日生理：HRV、睡眠、静息心率、压力；
 - 标签：每日主观 + 运动后 RPE/Feel；
-- 天气：Open-Meteo（可选）。
+- 天气：Open-Meteo 逐小时（按活动 GPS 取点，`ingest/weather_hourly.py`）；
+- 海拔：FIT `enhanced_altitude` 绝对海拔 → `activities.alt_*` 九列
+  （`core/altitude.py` + `scripts/backfill_altitude.py`）。
+
+### 环境暴露（海拔 / 气温 / 湿度）
+
+```powershell
+D:\LeaderCoach\.venv\Scripts\python.exe -m ingest.weather_hourly --start 2026-03-11
+D:\LeaderCoach\.venv\Scripts\python.exe -m scripts.backfill_altitude   # 逐场绝对海拔
+D:\LeaderCoach\.venv\Scripts\python.exe -m core.environment           # 公式自检
+D:\LeaderCoach\.venv\Scripts\python.exe -m core.altitude              # 海拔自检
+```
+
+写入 `weather_hourly`（逐小时）/ `weather_activity`（活动级起跑时刻与场内变化）/
+`weather_exposure`（7 天体感均值、14 天 ≥28°C 训练小时、14 天热剂量）。
+海拔不单独采：FIT 的 `enhanced_altitude` 就是气压绝对海拔，回填进
+`activities.alt_mean_m / alt_min_m / alt_max_m / alt_sd_m / alt_start_m / alt_end_m /
+alt_samples / alt_source / alt_status`，再用 `core/environment.py` 换成气压、PIO2、
+VO2max 惩罚与 HRmax 修正。`alt_sd_m`（场内海拔标准差）可直接充当**路线起伏度**协变量。
+
+方法论见 `docs/altitude_weather_effects.md`（四种海拔效应、公式、可识别性分级）。
 
 ### Garmin 插件全量采集（v1.8）
 
@@ -282,13 +302,24 @@ ingest/     采集：插件桥、FIT/CSV、天气
 ml/         模型：特征、基线、转移、暴露、锚点
 templates/  T1–T6 模板
 db/         schema.sql / seed.sql
-mcp_server/ MCP 工具
+mcp_server/ Garmin MCP 工具
+coros_mcp/  COROS MCP（独立进程，共用 core/ 与同一个库）
+scripts/    独立脚本：COROS 授权、活动导入、海拔回填
 coach/      提示词模板
 tests/      引擎与 schema 测试
 ```
 
 ## 更新
 
+- 2026-11-12（v1.15）：新增 `coros-coach`——独立的 COROS MCP，与 `garmin-coach`
+  并列。数据进同一个库、分析用同一套 `core/`，靠新增的 `source` 维度隔离：
+  `activities` 加 `source`/`external_id` 并以 `(source, external_id)` 做唯一键，
+  `daily_metrics`/`engine_daily`/`sleep_stages`/`garmin_metrics` 主键加 `source`，
+  旧库在 `get_conn` 里只读探测后单事务重建（幂等）。所有基线窗口、负荷序列、
+  睡眠评分、坡度池化统计、RPE 定位按源过滤；新增 `[source] active` 显式指定当前源，
+  不自动推断（两台设备同时戴会一天一个口径）。`sleep_series` 不加 `source`：
+  它是 SDK 直读的分钟级序列，COROS 只给阶段百分比，只有一个生产者。
+  同版本顺手修掉 `get_conn` 每次开连接都抢写锁导致并发 `database is locked` 的问题。
 - 2026-11-11（v1.14）：修复僵尸同步任务。进程中途退出后，`sync_jobs` 里的 `running`
   不会结束，状态面板一直显示「同步卡住」。现在启动时与 `get_sync_status` 读取前会回收：
   内存中不存在、且启动超过 30 分钟的 `running` 记为 `interrupted`。同步改为串行执行。

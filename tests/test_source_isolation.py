@@ -246,3 +246,77 @@ def test_active_source_defaults_to_garmin():
     assert dbmod.active_source({}) == "garmin"
     assert dbmod.active_source(None) == "garmin"
     assert dbmod.active_source({"source": {"active": " COROS "}}) == "coros"
+
+
+# ── 并发 ───────────────────────────────────────────────────
+
+def test_get_conn_does_not_take_write_lock_every_time():
+    """get_conn 每次打开都拿写锁会让 MCP 多线程调用撞 database is locked。
+    迁移探测必须是只读的：已迁移的库重复开连接不得抢锁。"""
+    import threading
+    tmp = Path(tempfile.mkdtemp(prefix="coach_lock_"))
+    try:
+        cfg = _fresh_cfg(tmp)
+        conn = dbmod.get_conn(cfg)
+        conn.execute("INSERT INTO activities(source, external_id, start_time, sport_id,"
+                     " duration_min) VALUES('garmin','x','2026-07-01 07:00:00','run',60)")
+        conn.commit()
+        conn.close()
+
+        errs, ok = [], [0]
+
+        def worker():
+            try:
+                for _ in range(10):
+                    c = dbmod.get_conn(cfg)
+                    c.execute("SELECT COUNT(*) FROM activities").fetchone()
+                    c.close()
+                    ok[0] += 1
+            except Exception as e:  # noqa: BLE001
+                errs.append(f"{type(e).__name__}: {e}")
+
+        ts = [threading.Thread(target=worker) for _ in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert not errs, f"并发打开连接失败：{errs[:3]}"
+        assert ok[0] == 60
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_stats_scoped_by_source():
+    """覆盖度按源统计：Garmin 的分钟级序列不得出现在 COROS 的 stats 里。"""
+    from core import store_ext
+    tmp = Path(tempfile.mkdtemp(prefix="coach_stats_"))
+    try:
+        cfg = _fresh_cfg(tmp)
+        conn = dbmod.get_conn(cfg)
+        try:
+            for src in ("garmin", "coros"):
+                conn.execute(
+                    "INSERT INTO activities(source, external_id, start_time, sport_id,"
+                    " duration_min) VALUES(?,?,?,?,?)",
+                    (src, f"{src}-1", "2026-08-01 07:00:00", "run", 60))
+            aid = conn.execute("SELECT id FROM activities WHERE source='coros'").fetchone()[0]
+            conn.execute("INSERT INTO activity_split_detail(activity_id, split_type, seq,"
+                         " distance_m, duration_s) VALUES(?,'km',1,1000,300)", (aid,))
+            conn.execute("INSERT INTO daily_metrics(source,date,sleep_hours) "
+                         "VALUES('coros','2026-08-01',7.0)")
+            conn.execute("INSERT INTO sleep_series(date,kind,ts_local,value) "
+                         "VALUES('2026-08-01','hr','2026-08-01T01:00:00',50)")
+            conn.commit()
+
+            g = store_ext.stats(conn, "garmin")
+            c = store_ext.stats(conn, "coros")
+            assert g["activity_split_detail"] == 0
+            assert c["activity_split_detail"] == 1
+            assert c["daily_metrics_days"] == 1
+            # 只有 Garmin 有的分钟级序列：非 garmin 源必须是 null，不是 0 也不是真实值
+            assert c["sleep_series_days"] is None
+            assert g["sleep_series_days"] == 1
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

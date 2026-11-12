@@ -89,43 +89,57 @@ def _table_exists(conn, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
+def _source_migration_plan(conn) -> tuple[bool, list[str]]:
+    """只读探测：返回 (activities 需加列?, 需重建的表名列表)。
+
+    必须与真正的迁移分开：迁移要拿写锁，而 get_conn 每次都会跑探测。
+    早期实现直接在 get_conn 里 BEGIN IMMEDIATE，导致每个连接都抢一次写锁，
+    MCP 多线程调用时会撞上 database is locked。
+    """
+    acts_add = False
+    if _table_exists(conn, "activities"):
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(activities)")}
+        acts_add = ("source" not in cols) or ("external_id" not in cols)
+    rebuild = []
+    for name, _ddl, _cols in _SOURCE_TABLES:
+        if not _table_exists(conn, name):
+            continue
+        if "source" not in {r[1] for r in conn.execute(f"PRAGMA table_info({name})")}:
+            rebuild.append(name)
+    return acts_add, rebuild
+
+
 def _migrate_source_dimension(conn) -> bool:
     """幂等：给数据表加上 source 维度，现有行归为 garmin。
 
-    返回 True 说明本次真的动了结构。整个迁移在一个事务里，失败全部回滚。
-    调用方是 get_conn，因此新库（已在 DDL 里带 source）会直接跳过。
+    先只读探测，确实需要迁移时才拿写锁——否则每次 get_conn 都会争锁。
+    返回 True 说明本次真的动了结构。单个事务，失败整体回滚。
     """
-    if not _table_exists(conn, "activities") and not any(
-            _table_exists(conn, name) for name, _, _ in _SOURCE_TABLES):
-        return False  # 全新库，由 schema.sql / store_ext 直接建带 source 的表
+    acts_add, rebuild = _source_migration_plan(conn)
+    if not acts_add and not rebuild:
+        return False  # 已迁移（或全新库），不碰写锁
 
-    done = False
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # activities：加列即可，主键 id 不变（activity_split_detail 靠它外键）
+        # 拿到写锁后重新探测：另一个进程可能刚迁完
+        acts_add, rebuild = _source_migration_plan(conn)
+
         if _table_exists(conn, "activities"):
             cols = {r[1] for r in conn.execute("PRAGMA table_info(activities)")}
-            added = False
             if "source" not in cols:
                 conn.execute("ALTER TABLE activities ADD COLUMN source TEXT NOT NULL "
                              "DEFAULT 'garmin'")
-                added = True
             if "external_id" not in cols:
                 conn.execute("ALTER TABLE activities ADD COLUMN external_id TEXT")
-                added = True
-            if added:
+            if acts_add:
                 # Garmin 家的 external_id 就是它自己的 activityId
                 conn.execute("UPDATE activities SET external_id = garmin_activity_id "
                              "WHERE external_id IS NULL AND garmin_activity_id IS NOT NULL")
-                done = True
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_act_source_ext "
                          "ON activities(source, external_id)")
 
         for name, ddl, cols in _SOURCE_TABLES:
-            if not _table_exists(conn, name):
-                continue
-            have = {r[1] for r in conn.execute(f"PRAGMA table_info({name})")}
-            if "source" in have:
+            if name not in rebuild:
                 continue
             col_list = ", ".join(cols)
             marks = ", ".join("?" for _ in cols)
@@ -135,10 +149,9 @@ def _migrate_source_dimension(conn) -> bool:
                 f"INSERT INTO {name}__m(source, {col_list}) VALUES('garmin', {marks})", rows)
             conn.execute(f"DROP TABLE {name}")
             conn.execute(f"ALTER TABLE {name}__m RENAME TO {name}")
-            done = True
 
         conn.commit()
-        return done
+        return bool(acts_add or rebuild)
     except BaseException:
         conn.rollback()
         raise
